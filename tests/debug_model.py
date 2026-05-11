@@ -40,6 +40,8 @@ GGUF_TO_HF = {
     "gte-small": "thenlper/gte-small",
     "arctic-embed-xs": "Snowflake/snowflake-arctic-embed-xs",
     "multilingual-e5-small": "intfloat/multilingual-e5-small",
+    "paraphrase-multilingual-MiniLM-L12-v2":
+        "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
     "pixie-rune-v1": "CrispStrobe/PIXIE-Rune-v1.0",
     "arctic-embed-l-v2": "Snowflake/snowflake-arctic-embed-l-v2.0",
     "octen-0.6b": "Octen/Octen-Embedding-0.6B",

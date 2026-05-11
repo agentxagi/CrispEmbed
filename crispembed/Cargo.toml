@@ -1,8 +1,11 @@
 [package]
 name = "crispembed"
-version = "0.1.0"
+# Tracks /VERSION (the C library version) — same as crispembed-sys.
+version = "0.3.0"
 edition = "2021"
 description = "Safe Rust wrapper for crispembed text embedding inference"
+license = "MIT"
+repository = "https://github.com/CrispStrobe/CrispEmbed"
 
 [features]
 cuda   = ["crispembed-sys/cuda"]
@@ -10,4 +13,4 @@ metal  = ["crispembed-sys/metal"]
 vulkan = ["crispembed-sys/vulkan"]
 
 [dependencies]
-crispembed-sys = { path = "../crispembed-sys" }
+crispembed-sys = { path = "../crispembed-sys", version = "0.3.0" }

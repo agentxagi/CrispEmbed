@@ -17,6 +17,48 @@ fn print_link_info(lib_dir: &Path) {
     }
 }
 
+/// Emit `cargo:rustc-link-arg=-Wl,-rpath,...` so binaries built from this
+/// crate (and any reverse-dep crate that links it) can find
+/// `libcrispembed` plus its ggml siblings at runtime.
+///
+/// On macOS the dylib's install name is `@rpath/libcrispembed.0.dylib`, so
+/// without a resolving LC_RPATH on the consumer even `cargo run` fails
+/// with "no LC_RPATH's found".
+///
+/// Three rpath entries are added on each Unix:
+///   * absolute path to the freshly built lib dir — lets `cargo run` and
+///     `cargo test` work directly from the workspace.
+///   * absolute path to `<build>/ggml/src` — same, for the ggml siblings.
+///   * `@executable_path/../Frameworks` / `$ORIGIN/../lib` — relative entry
+///     so an end-user binary works once shipped (Tauri bundle, Debian
+///     package, etc.). The `$ORIGIN` literal must reach the linker
+///     un-substituted, so cargo's pass-through is exactly what we need.
+fn emit_runtime_rpath(lib_dir: &Path) {
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let lib_dir_str = lib_dir.display();
+    // ggml siblings: when consuming a freshly-built tree, they live under
+    // `<lib_dir>/ggml/src`; when consuming an installed prefix, they live
+    // alongside libcrispembed (so the lib_dir itself works).
+    let ggml_dir = lib_dir.join("ggml").join("src");
+    let ggml_dir_str = ggml_dir.display();
+    match target_os.as_str() {
+        "macos" => {
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{lib_dir_str}");
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{ggml_dir_str}");
+            println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/../Frameworks");
+            println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path/../Frameworks");
+            println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path/../lib");
+        }
+        "linux" => {
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{lib_dir_str}");
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{ggml_dir_str}");
+            println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib");
+            println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+        }
+        _ => {} // Windows: DLL search path includes the exe's directory.
+    }
+}
+
 fn has_prebuilt(dir: &Path) -> bool {
     dir.join("crispembed.lib").exists()
         || dir.join("Release").join("crispembed.lib").exists()
@@ -93,13 +135,13 @@ fn main() {
 
     let lib_dir = try_prebuilt(src_root).unwrap_or_else(|| configure_and_build(src_root));
     print_link_info(&lib_dir);
+    emit_runtime_rpath(&lib_dir);
 
     // Publish the resolved lib dir on Cargo's `links = "crispembed"`
-    // metadata channel so direct dependents (e.g., a downstream Tauri
-    // app's build.rs) see `DEP_CRISPEMBED_LIB_DIR` and can emit
-    // `cargo:rustc-link-arg=-Wl,-rpath,…` against it. Cargo only
-    // forwards links metadata to immediate dependents, which is why
-    // we don't try to emit the rpath args directly from this build
-    // script — they wouldn't propagate.
+    // metadata channel so direct dependents see `DEP_CRISPEMBED_LIB_DIR`
+    // and can emit additional `cargo:rustc-link-arg=-Wl,-rpath,…` against
+    // it if they need to. Cargo only forwards links metadata to immediate
+    // dependents — this crate already emits the most common rpath entries
+    // via `emit_runtime_rpath`, but consumers can layer more on top.
     println!("cargo:LIB_DIR={}", lib_dir.display());
 }

@@ -3,4 +3,6 @@
 from ._binding import CrispEmbed
 
 __all__ = ["CrispEmbed"]
-__version__ = "0.1.0"
+# Tracks /VERSION (the C library version). Wheel CI copies the freshly built
+# libcrispembed.{so,dylib,dll} + ggml siblings alongside this file.
+__version__ = "0.3.0"

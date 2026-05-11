@@ -1,5 +1,17 @@
 cmake_minimum_required(VERSION 3.14)
-project(crispembed LANGUAGES C CXX)
+
+# Read project version from the VERSION file (single source of truth shared
+# with release.yml, crispembed-sys/Cargo.toml, etc.). Bumping the file is
+# the release ritual.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" CRISPEMBED_VERSION_RAW)
+string(STRIP "${CRISPEMBED_VERSION_RAW}" CRISPEMBED_VERSION_RAW)
+project(crispembed VERSION ${CRISPEMBED_VERSION_RAW} LANGUAGES C CXX)
+
+# SOVERSION 0: ABI is not yet declared stable. Bump to 1 when cutting v1.0.
+set(CRISPEMBED_SOVERSION 0)
+
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -129,6 +141,17 @@ endif()
 # ---------------------------------------------------------------------------
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
 
+# Installed binaries live in <prefix>/bin and need to find their .so/.dylib
+# siblings in <prefix>/lib. The literal $ORIGIN must be single-quoted to
+# survive CMake's processing.
+if(APPLE)
+    set(CRISPEMBED_BIN_INSTALL_RPATH "@loader_path/../lib")
+elseif(UNIX)
+    set(CRISPEMBED_BIN_INSTALL_RPATH "$ORIGIN/../lib")
+else()
+    set(CRISPEMBED_BIN_INSTALL_RPATH "")
+endif()
+
 add_executable(crispembed-cli
     examples/cli/main.cpp
 )
@@ -136,8 +159,11 @@ target_include_directories(crispembed-cli PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/examples/cli
 )
 target_link_libraries(crispembed-cli PRIVATE crispembed)
-set_target_properties(crispembed-cli PROPERTIES OUTPUT_NAME crispembed)
-install(TARGETS crispembed-cli RUNTIME)
+set_target_properties(crispembed-cli PROPERTIES
+    OUTPUT_NAME  crispembed
+    INSTALL_RPATH "${CRISPEMBED_BIN_INSTALL_RPATH}"
+)
+install(TARGETS crispembed-cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 add_executable(crispembed-server
     examples/server/server.cpp
@@ -148,7 +174,10 @@ target_include_directories(crispembed-server PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/examples/cli
 )
 target_link_libraries(crispembed-server PRIVATE crispembed)
-install(TARGETS crispembed-server RUNTIME)
+set_target_properties(crispembed-server PROPERTIES
+    INSTALL_RPATH "${CRISPEMBED_BIN_INSTALL_RPATH}"
+)
+install(TARGETS crispembed-server RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 add_executable(crispembed-quantize
     tools/quantize.cpp
@@ -157,30 +186,120 @@ target_include_directories(crispembed-quantize PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include
 )
 target_link_libraries(crispembed-quantize PRIVATE ggml ggml-base ggml-cpu)
-set_target_properties(crispembed-quantize PROPERTIES OUTPUT_NAME crispembed-quantize)
-install(TARGETS crispembed-quantize RUNTIME)
+set_target_properties(crispembed-quantize PROPERTIES
+    OUTPUT_NAME  crispembed-quantize
+    INSTALL_RPATH "${CRISPEMBED_BIN_INSTALL_RPATH}"
+)
+install(TARGETS crispembed-quantize RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 endif() # NOT iOS
 
 # ---------------------------------------------------------------------------
-# Shared library for Python bindings
+# Shared library — the public, distributable face of CrispEmbed.
+#
+# Layout after `cmake --install build`:
+#   <prefix>/lib/libcrispembed.so.${VERSION}     (real file)
+#   <prefix>/lib/libcrispembed.so.0              (SONAME symlink)
+#   <prefix>/lib/libcrispembed.so                (linker symlink)
+#   <prefix>/lib/libggml*.so                     (ggml siblings, from ggml/)
+#   <prefix>/include/crispembed.h                (PUBLIC_HEADER)
+#   <prefix>/lib/cmake/crispembed/               (config + targets + version)
+#   <prefix>/lib/pkgconfig/crispembed.pc
+#
+# RPATH is set to $ORIGIN (Linux) / @loader_path (macOS) so the .so finds its
+# ggml siblings without LD_LIBRARY_PATH / DYLD_LIBRARY_PATH.
 # ---------------------------------------------------------------------------
 if(CRISPEMBED_BUILD_SHARED)
     add_library(crispembed-shared SHARED ${CRISPEMBED_SOURCES})
+
+    # Use BUILD_INTERFACE/INSTALL_INTERFACE so the include path differs for
+    # in-tree consumers (src/) vs find_package() consumers (<prefix>/include).
     target_include_directories(crispembed-shared PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/examples/cli
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/ggml/include>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/examples/cli>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     )
     target_compile_definitions(crispembed-shared PRIVATE CRISPEMBED_BUILD)
     if(CRISPEMBED_HAS_CRISP_AUDIO)
         target_compile_definitions(crispembed-shared PRIVATE CRISPEMBED_HAS_CRISP_AUDIO)
     endif()
-    target_link_libraries(crispembed-shared PUBLIC
+    # All ggml + crisp_audio + crispembed-core are STATIC libs baked into the
+    # shared .so/.dylib. Mark them PRIVATE so they don't leak into the export
+    # set — consumers of crispembed::crispembed (find_package) only see the
+    # C ABI in crispembed.h, never these internal symbols.
+    target_link_libraries(crispembed-shared PRIVATE
         crispembed-core ggml ggml-base ggml-cpu Threads::Threads
     )
     if(CRISPEMBED_HAS_CRISP_AUDIO)
-        target_link_libraries(crispembed-shared PUBLIC crisp_audio)
+        target_link_libraries(crispembed-shared PRIVATE crisp_audio)
     endif()
-    set_target_properties(crispembed-shared PROPERTIES OUTPUT_NAME crispembed)
+
+    set_target_properties(crispembed-shared PROPERTIES
+        OUTPUT_NAME   crispembed
+        VERSION       ${PROJECT_VERSION}
+        SOVERSION     ${CRISPEMBED_SOVERSION}
+        PUBLIC_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/src/crispembed.h"
+        # Sibling-resolved RPATH so a release tarball is self-contained.
+        # Build-tree RPATH preserved so dev iteration works without install.
+        BUILD_WITH_INSTALL_RPATH FALSE
+        INSTALL_RPATH_USE_LINK_PATH TRUE
+    )
+    if(APPLE)
+        set_target_properties(crispembed-shared PROPERTIES
+            INSTALL_RPATH "@loader_path")
+    elseif(UNIX)
+        set_target_properties(crispembed-shared PROPERTIES
+            INSTALL_RPATH "$ORIGIN")
+    endif()
+
+    # ---------- install ---------------------------------------------------
+    # We deliberately omit `EXPORT crispembed-targets` because the shared
+    # lib's transitive (private) link to ggml-cpu — itself a SHARED library
+    # — trips install(EXPORT)'s dependency-set check. Instead, the IMPORTED
+    # target is hand-rolled in `cmake/crispembed-config.cmake.in` via
+    # find_library(), which gives downstream `find_package(crispembed)` an
+    # equivalent `crispembed::crispembed` target with no ggml leakage.
+    install(TARGETS crispembed-shared
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}        # *.so / *.dylib
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}        # *.lib (Windows import lib)
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}        # *.dll (Windows)
+        PUBLIC_HEADER DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    )
+
+    # crispembed-config.cmake + crispembed-config-version.cmake
+    set(CRISPEMBED_INCLUDE_INSTALL_DIR ${CMAKE_INSTALL_INCLUDEDIR})
+    set(CRISPEMBED_LIB_INSTALL_DIR     ${CMAKE_INSTALL_LIBDIR})
+    set(CRISPEMBED_BIN_INSTALL_DIR     ${CMAKE_INSTALL_BINDIR})
+    set(CRISPEMBED_BUILD_COMMIT        "unknown")
+
+    configure_package_config_file(
+        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/crispembed-config.cmake.in
+        ${CMAKE_CURRENT_BINARY_DIR}/crispembed-config.cmake
+        INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/crispembed
+        PATH_VARS
+            CRISPEMBED_INCLUDE_INSTALL_DIR
+            CRISPEMBED_LIB_INSTALL_DIR
+            CRISPEMBED_BIN_INSTALL_DIR
+    )
+    write_basic_package_version_file(
+        ${CMAKE_CURRENT_BINARY_DIR}/crispembed-config-version.cmake
+        VERSION ${PROJECT_VERSION}
+        COMPATIBILITY SameMajorVersion
+    )
+    install(FILES
+            ${CMAKE_CURRENT_BINARY_DIR}/crispembed-config.cmake
+            ${CMAKE_CURRENT_BINARY_DIR}/crispembed-config-version.cmake
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/crispembed
+    )
+
+    # pkg-config for autotools / meson consumers.
+    configure_file(
+        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/crispembed.pc.in
+        ${CMAKE_CURRENT_BINARY_DIR}/crispembed.pc
+        @ONLY
+    )
+    install(FILES ${CMAKE_CURRENT_BINARY_DIR}/crispembed.pc
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
+    )
 endif()

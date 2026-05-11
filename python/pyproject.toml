@@ -1,0 +1,94 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crispembed"
+# Mirrors /VERSION at the repo root. Update both in lockstep.
+version = "0.3.0"
+description = "Lightweight ggml-based text embedding inference (BERT, XLM-R, MPNet, NomicBERT, ModernBERT, DeBERTa-v2, Qwen3, Gemma3, BidirLM-Omni). 23+ verified models, 9x faster than FastEmbed."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.8"
+authors = [
+    { name = "CrispEmbed contributors" },
+]
+keywords = [
+    "embeddings", "sentence-embeddings", "ggml", "bert",
+    "sentence-transformers", "rag", "vector-search",
+    "fastembed", "matryoshka", "multilingual",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Text Processing :: Linguistic",
+]
+dependencies = [
+    "numpy>=1.20",
+]
+
+[project.optional-dependencies]
+image = ["Pillow>=9.0"]
+test  = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/CrispStrobe/CrispEmbed"
+Repository = "https://github.com/CrispStrobe/CrispEmbed"
+Issues = "https://github.com/CrispStrobe/CrispEmbed/issues"
+
+# Package layout: the `crispembed/` subdir lives next to this file. Native
+# libs (libcrispembed.{so,dylib,dll}, libggml*.so, etc.) are NOT in the
+# git tree — they are produced by CMake and copied into crispembed/ by the
+# wheel CI step (.github/workflows/python-wheels.yml) before `pip wheel`
+# packages them. The `*` glob in `package-data` then catches whatever shape
+# of native lib the current platform emits.
+[tool.setuptools]
+packages = ["crispembed"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+crispembed = [
+    "*.so",
+    "*.so.*",
+    "*.dylib",
+    "*.dll",
+    "*.pyd",
+]
+
+# cibuildwheel configuration: the actual lib compile happens in
+# .github/workflows/python-wheels.yml's pre-build step (CMake), so
+# cibuildwheel just needs to package the already-staged tree. We pin
+# manylinux_2_28 because ggml's CPU SIMD paths (AVX, F16C) need a
+# recent-enough glibc + libstdc++.
+[tool.cibuildwheel]
+# Skip 32-bit, PyPy, and unsupported manylinux variants — we ship
+# x86_64 + aarch64 only for now.
+skip = ["*-win32", "*-manylinux_i686", "pp*", "*musllinux*"]
+build = ["cp38-*", "cp39-*", "cp310-*", "cp311-*", "cp312-*", "cp313-*"]
+build-verbosity = 1
+test-requires = ["pytest>=7"]
+# Smoke test: import + load native lib + check exposed model count.
+test-command = "python -c 'from crispembed import CrispEmbed; from crispembed._binding import _find_lib; print(_find_lib())'"
+
+[tool.cibuildwheel.linux]
+manylinux-x86_64-image = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
+archs = ["x86_64", "aarch64"]
+
+[tool.cibuildwheel.macos]
+archs = ["arm64"]
+
+[tool.cibuildwheel.windows]
+archs = ["AMD64"]

@@ -34,10 +34,15 @@
 extern "C" {
 #endif
 
-struct crispembed_context;
+// In C++, `struct crispembed_context;` alone makes `crispembed_context` a
+// usable type. In C, callers would have to write `struct crispembed_context *`
+// everywhere — so we provide a typedef so plain C consumers can use the bare
+// `crispembed_context *` form. (Discovered by the install verification test
+// at find_package() time — a C-only consumer of the installed header.)
+typedef struct crispembed_context crispembed_context;
 
 // Model hyperparameters (read-only after init)
-struct crispembed_hparams {
+typedef struct crispembed_hparams {
     int32_t n_vocab;
     int32_t n_max_tokens;    // max sequence length
     int32_t n_embd;          // embedding dimension (hidden size)
@@ -46,7 +51,7 @@ struct crispembed_hparams {
     int32_t n_intermediate;  // FFN intermediate size
     int32_t n_output;        // output embedding dimension (may differ from n_embd)
     float   layer_norm_eps;
-};
+} crispembed_hparams;
 
 // Initialize: load GGUF model, allocate ggml backends.
 // n_threads: CPU threads for matmul (0 = auto).

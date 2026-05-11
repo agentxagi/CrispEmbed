@@ -64,6 +64,10 @@ jobs:
       - name: Build
         run: cmake --build build --config Release -j4
 
+      - name: Install patchelf (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y patchelf
+
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
@@ -85,6 +89,50 @@ jobs:
           cp src/crispembed.h pkg/include/ 2>/dev/null || true
           cp ggml/include/*.h pkg/include/ 2>/dev/null || true
           cp README.md LICENSE pkg/ 2>/dev/null || true
+
+          # Patch RPATH so the tarball is self-contained. The build-tree
+          # RPATH points at absolute paths on the GitHub runner (e.g.,
+          # /home/runner/work/CrispEmbed/CrispEmbed/build/ggml/src), which
+          # are nonsense after extraction on a user's machine. Rewrite to
+          # $ORIGIN (Linux) / @loader_path (macOS) so libs find siblings
+          # in the same directory without LD_LIBRARY_PATH.
+          if [ "${{ runner.os }}" = "Linux" ]; then
+              for f in pkg/libcrispembed.so* pkg/libggml*.so* \
+                       pkg/crispembed pkg/crispembed-server pkg/crispembed-quantize; do
+                  [ -f "$f" ] || continue
+                  # readonly symlinks (libcrispembed.so → .so.0 → .so.X.Y.Z)
+                  # don't need patching — only the real file does. patchelf
+                  # errors on symlinks, so skip them.
+                  [ -L "$f" ] && continue
+                  patchelf --set-rpath '$ORIGIN' "$f" 2>/dev/null || true
+              done
+          elif [ "${{ runner.os }}" = "macOS" ]; then
+              # On macOS the dylibs already link via @rpath/... install names.
+              # The runner's RPATH was set to the build dir; rewrite to
+              # @loader_path so siblings resolve correctly.
+              for f in pkg/libcrispembed.dylib pkg/libcrispembed.*.dylib \
+                       pkg/libggml*.dylib; do
+                  [ -f "$f" ] || continue
+                  [ -L "$f" ] && continue
+                  # Strip any existing rpaths (build-time absolute paths),
+                  # then add the relative one. `|| true` because each call
+                  # may fail if the path isn't present, which is fine.
+                  current_rpaths=$(otool -l "$f" | awk '/LC_RPATH/{found=1} found && /path /{print $2; found=0}')
+                  for rp in $current_rpaths; do
+                      install_name_tool -delete_rpath "$rp" "$f" 2>/dev/null || true
+                  done
+                  install_name_tool -add_rpath '@loader_path' "$f" 2>/dev/null || true
+              done
+              for bin in pkg/crispembed pkg/crispembed-server pkg/crispembed-quantize; do
+                  [ -f "$bin" ] || continue
+                  current_rpaths=$(otool -l "$bin" | awk '/LC_RPATH/{found=1} found && /path /{print $2; found=0}')
+                  for rp in $current_rpaths; do
+                      install_name_tool -delete_rpath "$rp" "$bin" 2>/dev/null || true
+                  done
+                  install_name_tool -add_rpath '@loader_path' "$bin" 2>/dev/null || true
+              done
+          fi
+
           tar -czf ${{ matrix.archive }} -C pkg .
 
       - name: Package (Windows)
@@ -129,6 +177,208 @@ jobs:
         with:
           name: ${{ matrix.name }}
           path: ${{ matrix.archive }}
+
+  # ─── Linux x86_64 + CUDA ──────────────────────────────────────────────
+  # Self-contained tarball with libcrispembed.so + libggml-cuda.so + the
+  # standard CPU backend libs. End users must have a matching CUDA driver
+  # (12.x) on the host; we don't ship cudart/cublas because Linux dev
+  # boxes that consume a -cuda tarball normally have CUDA installed
+  # system-wide.
+  build-linux-x86_64-cuda:
+    name: Build linux-x86_64-cuda
+    runs-on: ubuntu-latest
+    env:
+      CUDA_VERSION: "12.8.0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install patchelf
+        run: sudo apt-get update && sudo apt-get install -y patchelf
+
+      - name: Install CUDA Toolkit ${{ env.CUDA_VERSION }}
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          method: 'network'
+          # Same package mapping CrispASR uses — `cuda-nvcc`/`cudart`/
+          # `nvrtc-dev` come from the cuda- prefix; cuBLAS dev headers
+          # live under the lib- prefix and need `non-cuda-sub-packages`.
+          sub-packages: '["nvcc", "cudart", "nvrtc-dev"]'
+          non-cuda-sub-packages: '["libcublas-dev"]'
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DCRISPEMBED_BUILD_SHARED=ON
+          -DGGML_CUDA=ON
+          -DGGML_BLAS=OFF
+
+      - name: Build
+        run: cmake --build build --config Release -j4
+
+      - name: Package
+        run: |
+          mkdir -p pkg
+          for bin in crispembed crispembed-server crispembed-quantize; do
+            cp build/$bin pkg/ 2>/dev/null || true
+          done
+          cp -P build/libcrispembed.so* pkg/ 2>/dev/null || true
+          find build/ggml/src -name 'libggml*' \( -type f -o -type l \) \
+            -exec cp -P {} pkg/ \; 2>/dev/null || true
+          mkdir -p pkg/include
+          cp src/crispembed.h pkg/include/ 2>/dev/null || true
+          cp ggml/include/*.h pkg/include/ 2>/dev/null || true
+          cp README.md LICENSE pkg/ 2>/dev/null || true
+          # Patch RPATH so libggml-cuda.so finds its siblings without
+          # LD_LIBRARY_PATH — CUDA users still rely on the host's
+          # libcudart.so.12 / libcublas.so.12, those resolve via the
+          # standard linker search path.
+          for f in pkg/libcrispembed.so* pkg/libggml*.so* \
+                   pkg/crispembed pkg/crispembed-server pkg/crispembed-quantize; do
+              [ -f "$f" ] || continue
+              [ -L "$f" ] && continue
+              patchelf --set-rpath '$ORIGIN' "$f" 2>/dev/null || true
+          done
+          tar -czf crispembed-linux-x86_64-cuda.tar.gz -C pkg .
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64-cuda
+          path: crispembed-linux-x86_64-cuda.tar.gz
+
+  # ─── Windows x86_64 + CUDA ────────────────────────────────────────────
+  # Bundles cudart64_12.dll + cublas64_12.dll alongside the CrispEmbed
+  # DLLs, so the zip is plug-and-play even if the user doesn't have CUDA
+  # installed system-wide (common on Windows dev boxes).
+  build-windows-x86_64-cuda:
+    name: Build windows-x86_64-cuda
+    runs-on: windows-latest
+    env:
+      CUDA_VERSION: "12.8.0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install CUDA Toolkit ${{ env.CUDA_VERSION }}
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          method: 'network'
+          sub-packages: '["nvcc", "cudart", "cublas", "nvrtc_dev"]'
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DCRISPEMBED_BUILD_SHARED=ON
+          -DGGML_CUDA=ON
+          -DGGML_BLAS=OFF
+
+      - name: Build
+        run: cmake --build build --config Release -j4
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path pkg
+          foreach ($bin in "crispembed.exe","crispembed-server.exe","crispembed-quantize.exe") {
+            Copy-Item "build/Release/$bin" pkg/ -ErrorAction SilentlyContinue
+          }
+          Copy-Item "build/Release/crispembed.dll", "build/Release/crispembed.lib" pkg/ -ErrorAction SilentlyContinue
+          Get-ChildItem -Path "build" -Recurse -Filter "ggml*.dll" | ForEach-Object {
+              Copy-Item $_.FullName pkg/ -Force
+          }
+          Get-ChildItem -Path "build/ggml" -Recurse -Filter "ggml*.lib" | ForEach-Object {
+              Copy-Item $_.FullName pkg/ -Force
+          }
+          # Bundle CUDA runtime DLLs so the zip is self-contained.
+          $cuda_bin = "$env:CUDA_PATH\bin"
+          foreach ($dll in "cudart64_12.dll","cublas64_12.dll","cublasLt64_12.dll") {
+              if (Test-Path "$cuda_bin\$dll") {
+                  Copy-Item "$cuda_bin\$dll" pkg/ -Force
+              }
+          }
+          New-Item -ItemType Directory -Force -Path pkg/include
+          Copy-Item "src/crispembed.h" pkg/include/ -ErrorAction SilentlyContinue
+          Get-ChildItem "ggml/include/*.h" | ForEach-Object {
+              Copy-Item $_.FullName pkg/include/
+          }
+          Copy-Item README.md, LICENSE pkg/ -ErrorAction SilentlyContinue
+          Compress-Archive -Path pkg/* -DestinationPath crispembed-windows-x86_64-cuda.zip
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64-cuda
+          path: crispembed-windows-x86_64-cuda.zip
+
+  # ─── Windows x86_64 + Vulkan ──────────────────────────────────────────
+  # Lighter-weight than CUDA — uses the system Vulkan loader, no CUDA
+  # toolchain required. Mirrors CrispASR's libcrispasr-*-vulkan layout.
+  build-windows-x86_64-vulkan:
+    name: Build windows-x86_64-vulkan
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: |
+          $ver = (Invoke-RestMethod -Uri "https://vulkan.lunarg.com/sdk/latest.json").windows
+          $url = "https://sdk.lunarg.com/sdk/download/$ver/windows/vulkan_sdk.exe"
+          Invoke-WebRequest -Uri $url -OutFile vulkan_sdk.exe
+          Start-Process -FilePath .\vulkan_sdk.exe `
+              -ArgumentList "--accept-licenses","--default-answer","--confirm-command","install" `
+              -Wait
+          $sdk = Get-ChildItem "C:\VulkanSDK" | Sort-Object Name -Descending | Select-Object -First 1
+          echo "VULKAN_SDK=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DCRISPEMBED_BUILD_SHARED=ON
+          -DGGML_VULKAN=ON
+          -DGGML_CUDA=OFF
+          -DGGML_BLAS=OFF
+
+      - name: Build
+        run: cmake --build build --config Release -j4
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path pkg
+          foreach ($bin in "crispembed.exe","crispembed-server.exe","crispembed-quantize.exe") {
+            Copy-Item "build/Release/$bin" pkg/ -ErrorAction SilentlyContinue
+          }
+          Copy-Item "build/Release/crispembed.dll", "build/Release/crispembed.lib" pkg/ -ErrorAction SilentlyContinue
+          Get-ChildItem -Path "build" -Recurse -Filter "ggml*.dll" | ForEach-Object {
+              Copy-Item $_.FullName pkg/ -Force
+          }
+          Get-ChildItem -Path "build/ggml" -Recurse -Filter "ggml*.lib" | ForEach-Object {
+              Copy-Item $_.FullName pkg/ -Force
+          }
+          New-Item -ItemType Directory -Force -Path pkg/include
+          Copy-Item "src/crispembed.h" pkg/include/ -ErrorAction SilentlyContinue
+          Get-ChildItem "ggml/include/*.h" | ForEach-Object {
+              Copy-Item $_.FullName pkg/include/
+          }
+          Copy-Item README.md, LICENSE pkg/ -ErrorAction SilentlyContinue
+          Compress-Archive -Path pkg/* -DestinationPath crispembed-windows-x86_64-vulkan.zip
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64-vulkan
+          path: crispembed-windows-x86_64-vulkan.zip
 
   build-android:
     name: Build android-${{ matrix.abi }}
@@ -184,7 +434,19 @@ jobs:
 
   create-release:
     name: Create GitHub Release
-    needs: [build, build-android, build-ios]
+    # GPU variants (cuda/vulkan) are best-effort: if a CUDA runner or
+    # Vulkan SDK has a transient failure we still want the CPU release
+    # to publish. `if: always() && !cancelled()` lets the release job
+    # run even when GPU jobs fail, and the file list below tolerates
+    # missing artifacts.
+    needs:
+      - build
+      - build-linux-x86_64-cuda
+      - build-windows-x86_64-cuda
+      - build-windows-x86_64-vulkan
+      - build-android
+      - build-ios
+    if: always() && !cancelled()
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -205,11 +467,15 @@ jobs:
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
+          fail_on_unmatched_files: false
           files: |
             dist/linux-x86_64/*.tar.gz
+            dist/linux-x86_64-cuda/*.tar.gz
             dist/linux-arm64/*.tar.gz
             dist/macos-arm64/*.tar.gz
             dist/windows-x86_64/*.zip
+            dist/windows-x86_64-cuda/*.zip
+            dist/windows-x86_64-vulkan/*.zip
             dist/android-arm64-v8a/*.tar.gz
             dist/android-armeabi-v7a/*.tar.gz
             dist/ios-arm64/*.tar.gz

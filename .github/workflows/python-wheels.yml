@@ -1,0 +1,161 @@
+name: Python wheels
+
+# Triggers:
+#   • workflow_dispatch  — manual run for testing
+#   • tags v* + path "-wheels" suffix (e.g., v0.3.0-wheels) — staging
+#   • tags v* by themselves — only build wheels for the actual release once
+#     the user is ready to publish to PyPI
+#
+# This workflow is **preview-grade**: not yet wired to twine-upload to PyPI.
+# It produces wheels as GitHub artifacts so they can be inspected /
+# downloaded / uploaded manually until the project registers a PyPI name
+# and adds the publish step.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-wheels:
+    name: ${{ matrix.os-name }} ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            os-name: linux
+            arch: x86_64
+            cibw-build: "cp38-* cp39-* cp310-* cp311-* cp312-* cp313-*"
+            cibw-archs: "x86_64"
+          - os: ubuntu-24.04-arm
+            os-name: linux
+            arch: aarch64
+            cibw-build: "cp38-* cp39-* cp310-* cp311-* cp312-* cp313-*"
+            cibw-archs: "aarch64"
+          - os: macos-latest
+            os-name: macos
+            arch: arm64
+            cibw-build: "cp39-* cp310-* cp311-* cp312-* cp313-*"
+            cibw-archs: "arm64"
+          - os: windows-latest
+            os-name: windows
+            arch: AMD64
+            cibw-build: "cp38-* cp39-* cp310-* cp311-* cp312-* cp313-*"
+            cibw-archs: "AMD64"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # ─── Stage the native lib so cibuildwheel can find it ─────────────
+      # cibuildwheel only mounts the `package-dir` (we'll set it to
+      # python/) into manylinux containers. Build libcrispembed *on the
+      # host runner* first and copy the artefacts into python/crispembed/
+      # so cibuildwheel just packages a pre-staged tree.
+      #
+      # Limitation: on Linux this builds against the runner's glibc, not
+      # the manylinux container's glibc. We mitigate via manylinux_2_28
+      # (cibuildwheel default for this workflow) which has a more recent
+      # libstdc++ than older runners. If end users hit "GLIBC_2.X not
+      # found" errors, switch to an in-container build via the
+      # CIBW_BEFORE_ALL_LINUX hook (Dockerfile path / repo mount).
+
+      - name: Configure (Unix)
+        if: runner.os != 'Windows'
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DCRISPEMBED_BUILD_SHARED=ON
+          ${{ runner.os == 'macOS' && '-DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=Apple' || '-DGGML_BLAS=OFF -DGGML_LLAMAFILE=ON' }}
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCRISPEMBED_BUILD_SHARED=ON -DGGML_BLAS=OFF
+
+      - name: Build
+        run: cmake --build build --config Release -j4
+
+      - name: Stage native libs into python/crispembed (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cp -P build/libcrispembed.* python/crispembed/ 2>/dev/null || true
+          find build/ggml/src -name 'libggml*' \( -type f -o -type l \) \
+            -exec cp -P {} python/crispembed/ \; 2>/dev/null || true
+          ls -la python/crispembed/
+
+      - name: Stage native libs into python/crispembed (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Copy-Item "build/Release/crispembed.dll" python/crispembed/ -ErrorAction SilentlyContinue
+          Get-ChildItem -Path "build" -Recurse -Filter "ggml*.dll" |
+              ForEach-Object { Copy-Item $_.FullName python/crispembed/ -Force }
+          Get-ChildItem python/crispembed/
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.21
+        with:
+          package-dir: python
+          output-dir: wheelhouse
+        env:
+          CIBW_BUILD: ${{ matrix.cibw-build }}
+          CIBW_ARCHS: ${{ matrix.cibw-archs }}
+          # Tell auditwheel/delocate to skip our bundled libs — they're
+          # part of the package, not external system deps to repair.
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: >-
+            auditwheel repair -w {dest_dir} {wheel}
+            --exclude libcrispembed.so --exclude 'libggml*.so'
+          CIBW_REPAIR_WHEEL_COMMAND_MACOS: >-
+            delocate-wheel --require-archs {delocate_archs} -w {dest_dir} -v {wheel}
+            --ignore-missing-dependencies
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os-name }}-${{ matrix.arch }}
+          path: wheelhouse/*.whl
+
+  # Aggregator job for later promotion to PyPI. Currently it just
+  # downloads every wheel into a single `wheels-all/` artifact for easy
+  # manual inspection.
+  aggregate:
+    name: Aggregate wheels
+    needs: build-wheels
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Show inventory
+        run: |
+          find dist -name '*.whl' | sort
+          echo "---"
+          du -sh dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-all
+          path: dist/**/*.whl
+
+  # ─────────────────────────────────────────────────────────────────────
+  # PyPI publish step — DISABLED until the project name is registered.
+  # When you are ready:
+  #   1. Register `crispembed` (or chosen name) on https://pypi.org
+  #   2. Add a PyPI Trusted Publisher pointing at this workflow file
+  #   3. Remove `if: false` below and uncomment the upload step
+  # publish:
+  #   name: Publish to PyPI
+  #   needs: aggregate
+  #   runs-on: ubuntu-latest
+  #   if: false
+  #   environment: pypi
+  #   permissions:
+  #     id-token: write  # OIDC for trusted publishing
+  #   steps:
+  #     - uses: actions/download-artifact@v4
+  #       with:
+  #         name: wheels-all
+  #         path: dist/
+  #     - uses: pypa/gh-action-pypi-publish@release/v1

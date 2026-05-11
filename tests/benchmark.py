@@ -45,6 +45,8 @@ MODEL_MAP = {
     "all-MiniLM-L6-v2": "sentence-transformers/all-MiniLM-L6-v2",
     "gte-small": "thenlper/gte-small",
     "arctic-embed-xs": "Snowflake/snowflake-arctic-embed-xs",
+    "paraphrase-multilingual-MiniLM-L12-v2":
+        "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
     "octen-0.6b": "Octen/Octen-Embedding-0.6B",
     "harrier-0.6b": "Harrier/Harrier-OSS-v1-0.6B",
     "harrier-270m": "Harrier/Harrier-OSS-v1-270M",

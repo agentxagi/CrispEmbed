@@ -836,3 +836,72 @@ vision tower uses for the 4-corner pos-embed gather. DeepStack adds use the
 same `(H, T)` patch shape, one per layer for the first `n_deepstack` layers,
 zero everywhere except at image positions; `cur = ggml_add(cur, ds_patches[il])`
 after each layer's residual+ffn output mirrors HF's `_deepstack_process`.
+
+## Distribution: install(EXPORT) + ggml SHARED don't compose
+
+When `crispembed-shared` is a SHARED library that PRIVATEly links a SHARED
+ggml backend (`ggml-cpu`, `ggml-base`, …), `install(TARGETS crispembed-shared
+EXPORT crispembed-targets)` errors with:
+
+> install(EXPORT "crispembed-targets" …) includes target "crispembed-shared"
+> which requires target "ggml-cpu" that is not in any export set.
+
+The reason: even for PRIVATE link deps of a SHARED lib, CMake records them
+as `IMPORTED_LINK_DEPENDENT_LIBRARIES` so downstream consumers know what
+runtime SO names the .so will dlopen. install(EXPORT) demands those deps
+either be in some export set or be system-IMPORTED.
+
+Two viable workarounds:
+
+1. **Hand-rolled IMPORTED target** (what CrispEmbed does, mirroring
+   CrispASR): skip `install(EXPORT)` entirely. The `crispembed-config.cmake.in`
+   uses `find_library(crispembed_LIBRARY crispembed HINTS …)` plus
+   `add_library(crispembed::crispembed UNKNOWN IMPORTED)` to manufacture
+   the IMPORTED target at config time. Runtime resolution of `libggml*.so`
+   siblings is handled entirely by the .so's RPATH (`$ORIGIN` /
+   `@loader_path`), not by the consumer's link line.
+2. **Add ggml to the same EXPORT** via `set_target_properties(ggml*
+   PROPERTIES EXPORT_NAME …)` and put ggml's install in your export.
+   More invasive and requires patching the ggml submodule.
+
+(1) is the right choice when the .so is the only thing the user sees and
+ggml is implementation detail; (2) is right when you want consumers to be
+able to `find_package(ggml)` separately.
+
+## Distribution: relocatable pkg-config via ${pcfiledir}
+
+`@CMAKE_INSTALL_PREFIX@` in a `.pc.in` is bound at configure time, not
+install time. A user who runs `cmake --install build --prefix /opt/foo`
+gets a `.pc` file with `prefix=/usr/local` (the configure default), and
+`pkg-config --libs crispembed` returns wrong paths.
+
+The fix is the **relocatable** pattern — set `prefix` from the .pc file's
+own location:
+
+```pc
+prefix=${pcfiledir}/../..
+libdir=${prefix}/lib
+```
+
+Since the .pc lives at `<prefix>/lib/pkgconfig/crispembed.pc`, going
+`../..` from there is the prefix dir, no matter where the user dropped it.
+Verified across `cmake --install --prefix /tmp/...`, tarball extraction
+into `/opt/foo`, and the standard `/usr/local`.
+
+## Distribution: forward-declared structs need typedefs for C consumers
+
+`crispembed.h` had `struct crispembed_context;` plus function signatures
+like `crispembed_context * ctx`. In C++ the struct name lives in the type
+namespace so this compiles; in **C** the caller has to write
+`struct crispembed_context *` everywhere. Adding
+
+```c
+typedef struct crispembed_context crispembed_context;
+typedef struct crispembed_hparams { … } crispembed_hparams;
+```
+
+(forward-decl style for opaque types, full definition for value types) was
+caught by the install verification test — a plain-C consumer of the
+freshly `cmake --install`-ed header. The build directory consumers
+(crispembed-cli, crispembed-server) didn't catch it because they're
+compiled as C++.

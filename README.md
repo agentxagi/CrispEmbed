@@ -171,6 +171,49 @@ git submodule update --init --recursive
 - **Required**: C++17 compiler, CMake 3.14+
 - **Optional**: OpenBLAS (`apt install libopenblas-dev`), Intel MKL, CUDA Toolkit, Vulkan SDK
 
+### Installing as a system library
+
+`cmake --install build --prefix /usr/local` (or any other prefix) lays out
+a standard distro tree:
+
+```
+<prefix>/
+  bin/{crispembed, crispembed-server, crispembed-quantize}
+  lib/
+    libcrispembed.so.0.3.0        (real file)
+    libcrispembed.so.0            (SONAME symlink — SOVERSION 0)
+    libcrispembed.so              (linker symlink)
+    libggml*.so*                  (ggml backend siblings)
+    cmake/crispembed/             (find_package(crispembed) plumbing)
+    pkgconfig/crispembed.pc       (pkg-config --cflags --libs crispembed)
+  include/
+    crispembed.h
+    ggml*.h
+```
+
+The installed `.so`/`.dylib` carries `RPATH=$ORIGIN` (Linux) / `@loader_path`
+(macOS) so it finds its `libggml*` siblings without `LD_LIBRARY_PATH`. The
+installed binaries carry `RPATH=$ORIGIN/../lib` / `@loader_path/../lib`.
+
+Downstream CMake consumers:
+
+```cmake
+find_package(crispembed REQUIRED)
+target_link_libraries(my_app PRIVATE crispembed::crispembed)
+```
+
+Downstream pkg-config consumers:
+
+```sh
+$ pkg-config --cflags --libs crispembed
+-I/usr/local/include -L/usr/local/lib -lcrispembed
+```
+
+The pkg-config file is **relocatable** (`prefix=${pcfiledir}/../..`), so
+extracting a release tarball into `/opt/foo` and pointing
+`PKG_CONFIG_PATH=/opt/foo/lib/pkgconfig` Just Works without editing the
+`.pc` file.
+
 ## Converting models
 
 ```bash

@@ -35,6 +35,9 @@ MODEL_MAP = {
     # XLM-R encoder models
     "multilingual-e5-small": "intfloat/multilingual-e5-small",
     "arctic-embed-l-v2": "Snowflake/snowflake-arctic-embed-l-v2.0",
+    # BERT body with XLM-R SentencePiece vocab (model_type=bert, no pos offset)
+    "paraphrase-multilingual-MiniLM-L12-v2":
+        "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
     # Qwen3 decoder models
     "octen-0.6b": "Octen/Octen-Embedding-0.6B",
     "f2llm-v2-0.6b": "codefuse-ai/F2LLM-v2-0.6B",
