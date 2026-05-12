@@ -236,7 +236,7 @@ struct graph_node {
     std::string output;
 };
 static std::vector<graph_node> parse_graph(const std::string& graph_str);
-static ggml_tensor* replay_graph(ggml_context* g, context* ctx, ggml_tensor* input, const std::vector<graph_node>& nodes, std::vector<ggml_tensor*>& output_tensors);
+static ggml_tensor* replay_graph(ggml_context* g, context* ctx, ggml_tensor* input, const std::vector<graph_node>& nodes, std::vector<ggml_tensor*>& output_tensors, std::map<std::string, ggml_tensor*>* tensor_map_out = nullptr);
 
 std::vector<float> encode(context* ctx, const float* pixels, int H, int W) {
     if (!ctx || H != ctx->input_h || W != ctx->input_w) return {};
@@ -424,23 +424,44 @@ std::vector<face_detection> detect(context* ctx, const float* pixels, int H, int
     ggml_set_name(x, "input");
     ggml_set_input(x);
 
-    // Run graph replay — register all intermediate tensors
+    // Run graph replay — get tensor map for output reading
+    std::map<std::string, ggml_tensor*> tensor_map;
     std::vector<ggml_tensor*> output_tensors;
-    ggml_tensor* last = replay_graph(g, ctx, x, nodes, output_tensors);
+    ggml_tensor* last = replay_graph(g, ctx, x, nodes, output_tensors, &tensor_map);
     if (!last) { ggml_free(g); return {}; }
 
-    // Mark the final output tensor
+    // Mark the 9 SCRFD detection output tensors
+    // SCRFD outputs: score/bbox/kps at 3 strides
+    // Output names from ONNX (stored in cnn.output.N.name metadata)
+    const char* score_names[] = {"448", "471", "494"};
+    const char* bbox_names[] = {"451", "474", "497"};
+    const char* kps_names[] = {"454", "477", "500"};
+
+    for (int i = 0; i < 3; i++) {
+        for (const char* name : {score_names[i], bbox_names[i], kps_names[i]}) {
+            auto it = tensor_map.find(name);
+            if (it != tensor_map.end()) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "out_%s", name);
+                ggml_set_name(it->second, buf);
+                ggml_set_output(it->second);
+            }
+        }
+    }
     ggml_set_name(last, "det_out");
     ggml_set_output(last);
 
-    // SCRFD: also mark the 9 detection output tensors so we can read them
-    // Output names: score=448/471/494, bbox=451/474/497, kps=454/477/500
-    // These are the last few tensors in the graph replay's tensor map
-    // Mark the last tensor from each Sigmoid and Reshape as output
-    // (they're all in the graph but only "det_out" is marked)
-
-    // Build + allocate + compute
+    // Build graph — expand from ALL output tensors (not just last)
     ggml_cgraph* gf = ggml_new_graph_custom(g, max_nodes, false);
+    // Add detection outputs first so they're in the graph
+    for (int i = 0; i < 3; i++) {
+        for (const char* name : {score_names[i], bbox_names[i], kps_names[i]}) {
+            auto it = tensor_map.find(name);
+            if (it != tensor_map.end()) {
+                ggml_build_forward_expand(gf, it->second);
+            }
+        }
+    }
     ggml_build_forward_expand(gf, last);
 
     ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
@@ -453,35 +474,97 @@ std::vector<face_detection> detect(context* ctx, const float* pixels, int H, int
 
     ggml_backend_graph_compute(ctx->backend, gf);
 
-    // ── Read detection outputs from graph replay tensor map ──
-    // The graph replay registered all intermediate tensors by name.
-    // We need the 9 ONNX outputs. After graph compute, read their data.
-    // Note: outputs go through Sigmoid/Reshape/Transpose which are passthrough
-    // in our replayer, so the tensor data is the raw conv output.
-
-    // SCRFD output order: 3 strides × (score[N,1], bbox[N,4], kps[N,10])
-    // Output names are stored as cnn.output.N.name
-    // Scores need sigmoid; bboxes are distance-encoded
+    // ── SCRFD post-processing: decode anchors ──
     const int strides[] = {8, 16, 32};
     const int num_anchors_per_loc = 2;
     std::vector<face_detection> dets;
 
-    // Read the SCRFD Mul outputs (scaled bboxes) and Sigmoid outputs (scores)
-    // For each stride, the detection head produces:
-    //   cls Conv → Transpose → Reshape → Sigmoid → score tensor
-    //   reg Conv → Mul(scale) → Transpose → Reshape → bbox tensor
-    //   kps Conv → Transpose → Reshape → kps tensor
-    // After graph replay, these tensors are registered under the Sigmoid/Reshape output names.
+    for (int si = 0; si < 3; si++) {
+        int stride = strides[si];
+        int grid_h = H / stride;
+        int grid_w = W / stride;
 
-    // For now, we detect using the raw last tensor (graph topology ends at the outputs).
-    // Full anchor decode requires reading specific named tensors.
-    // TODO: collect output tensor data and decode anchors properly.
+        // Read output tensors by name
+        char score_buf[32], bbox_buf[32], kps_buf[32];
+        snprintf(score_buf, sizeof(score_buf), "out_%s", score_names[si]);
+        snprintf(bbox_buf, sizeof(bbox_buf), "out_%s", bbox_names[si]);
+        snprintf(kps_buf, sizeof(kps_buf), "out_%s", kps_names[si]);
+
+        ggml_tensor* score_t = ggml_graph_get_tensor(gf, score_buf);
+        ggml_tensor* bbox_t = ggml_graph_get_tensor(gf, bbox_buf);
+        ggml_tensor* kps_t = ggml_graph_get_tensor(gf, kps_buf);
+
+        if (!score_t || !bbox_t) {
+            fprintf(stderr, "cnn_embed: stride %d outputs not found\n", stride);
+            continue;
+        }
+
+        int n_total = (int)ggml_nelements(score_t);
+        // Debug: print score stats
+        { std::vector<float> all_s(n_total); ggml_backend_tensor_get(score_t, all_s.data(), 0, n_total*4);
+        float mx = -1e9, mn = 1e9, sum = 0; for (float s : all_s) { mx = std::max(mx, s); mn = std::min(mn, s); sum += s; }
+        fprintf(stderr, "  scores: n=%d min=%.4f max=%.4f mean=%.6f\n", n_total, mn, mx, sum/n_total); }
+        std::vector<float> scores(n_total);
+        ggml_backend_tensor_get(score_t, scores.data(), 0, n_total * sizeof(float));
+
+        int bbox_n = (int)ggml_nelements(bbox_t);
+        std::vector<float> bboxes(bbox_n);
+        ggml_backend_tensor_get(bbox_t, bboxes.data(), 0, bbox_n * sizeof(float));
+
+        std::vector<float> kps_data;
+        if (kps_t) {
+            int kps_n = (int)ggml_nelements(kps_t);
+            kps_data.resize(kps_n);
+            ggml_backend_tensor_get(kps_t, kps_data.data(), 0, kps_n * sizeof(float));
+        }
+
+        // Decode anchors
+        int idx = 0;
+        for (int row = 0; row < grid_h; row++) {
+            for (int col = 0; col < grid_w; col++) {
+                for (int a = 0; a < num_anchors_per_loc; a++, idx++) {
+                    if (idx >= n_total) break;
+                    // Score (already through sigmoid in graph)
+                    float score = scores[idx];
+                    if (score < conf_threshold) continue;
+
+                    float cx = (col + 0.5f) * stride;
+                    float cy = (row + 0.5f) * stride;
+
+                    // Bbox: [left, top, right, bottom] distances from anchor center
+                    int bi = idx * 4;
+                    if (bi + 3 >= bbox_n) continue;
+                    float x1 = cx - bboxes[bi + 0] * stride;
+                    float y1 = cy - bboxes[bi + 1] * stride;
+                    float x2 = cx + bboxes[bi + 2] * stride;
+                    float y2 = cy + bboxes[bi + 3] * stride;
+
+                    face_detection det;
+                    det.x = x1;
+                    det.y = y1;
+                    det.w = x2 - x1;
+                    det.h = y2 - y1;
+                    det.confidence = score;
+                    memset(det.landmarks, 0, sizeof(det.landmarks));
+
+                    // Keypoints: 5 × (dx, dy) relative to anchor center
+                    if (!kps_data.empty()) {
+                        int ki = idx * 10;
+                        for (int k = 0; k < 5 && ki + k*2+1 < (int)kps_data.size(); k++) {
+                            det.landmarks[k*2]   = cx + kps_data[ki + k*2]   * stride;
+                            det.landmarks[k*2+1] = cy + kps_data[ki + k*2+1] * stride;
+                        }
+                    }
+                    dets.push_back(det);
+                }
+            }
+        }
+        fprintf(stderr, "cnn_embed: stride %d: %d anchors, %zu detections above %.2f\n",
+                stride, idx, dets.size(), conf_threshold);
+    }
 
     ggml_gallocr_free(alloc);
     ggml_free(g);
-
-    fprintf(stderr, "cnn_embed: SCRFD forward pass complete (%d nodes), post-processing pending\n",
-            (int)nodes.size());
 
     // NMS
     if (dets.size() > 1) {
@@ -615,7 +698,8 @@ static ggml_tensor* replay_graph(
     ggml_context* g, context* ctx,
     ggml_tensor* input,
     const std::vector<graph_node>& nodes,
-    std::vector<ggml_tensor*>& output_tensors)
+    std::vector<ggml_tensor*>& output_tensors,
+    std::map<std::string, ggml_tensor*>* tensor_map_out)
 {
     // Map from ONNX tensor name → ggml tensor
     std::map<std::string, ggml_tensor*> tensors;
@@ -835,6 +919,7 @@ static ggml_tensor* replay_graph(
         }
     }
 
+    if (tensor_map_out) *tensor_map_out = tensors;
     return last;
 }
 
