@@ -205,7 +205,32 @@ def main():
     # For now, store node list as a simple format
     node_descs = []
     for node in graph.node:
-        desc = f"{node.op_type}:{','.join(node.input)}:{','.join(node.output)}"
+        # Format: "OpType[attrs]:input1,input2,...:output1,output2,..."
+        # Conv attrs: s=stride p=pad g=group
+        attrs = ""
+        if node.op_type == "Conv":
+            stride = [1, 1]
+            pads = [0, 0, 0, 0]
+            group = 1
+            for a in node.attribute:
+                if a.name == "strides": stride = list(a.ints)
+                if a.name == "pads": pads = list(a.ints)
+                if a.name == "group": group = a.i
+            attrs = f"[s{stride[0]}p{pads[0]}g{group}]"
+        elif node.op_type in ("AveragePool", "MaxPool"):
+            kernel = [1, 1]
+            stride = [1, 1]
+            pads = [0, 0, 0, 0]
+            for a in node.attribute:
+                if a.name == "kernel_shape": kernel = list(a.ints)
+                if a.name == "strides": stride = list(a.ints)
+                if a.name == "pads": pads = list(a.ints)
+            attrs = f"[k{kernel[0]}s{stride[0]}p{pads[0]}]"
+        elif node.op_type == "Resize":
+            attrs = "[nearest]"  # default mode
+            for a in node.attribute:
+                if a.name == "mode": attrs = f"[{a.s.decode()}]"
+        desc = f"{node.op_type}{attrs}:{','.join(node.input)}:{','.join(node.output)}"
         node_descs.append(desc)
     writer.add_string("cnn.graph_nodes", "|".join(node_descs))
 

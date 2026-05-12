@@ -441,6 +441,7 @@ void free(context* ctx) {
 namespace cnn_embed {
 
 struct graph_node {
+    std::string attrs;
     std::string op;
     std::vector<std::string> inputs;
     std::string output;
@@ -458,7 +459,14 @@ static std::vector<graph_node> parse_graph(const std::string& graph_str) {
         if (p1 == std::string::npos || p2 == p1) continue;
 
         graph_node gn;
-        gn.op = node_str.substr(0, p1);
+        std::string op_full = node_str.substr(0, p1);
+        auto bracket = op_full.find('[');
+        if (bracket != std::string::npos) {
+            gn.op = op_full.substr(0, bracket);
+            gn.attrs = op_full.substr(bracket+1, op_full.size()-bracket-2);
+        } else {
+            gn.op = op_full;
+        }
         std::string inputs_str = node_str.substr(p1+1, p2-p1-1);
         gn.output = node_str.substr(p2+1);
 
@@ -517,12 +525,14 @@ static ggml_tensor* replay_graph(
             if (!x || !w) { fprintf(stderr, "cnn_replay: Conv missing tensor\n"); continue; }
             // Cast to F16 for ggml_conv_2d
             if (w->type != GGML_TYPE_F16) w = ggml_cast(g, w, GGML_TYPE_F16);
-            // Detect depthwise: if w shape [kw, kh, 1, OC] and IC > 1
+            // Conv attributes from graph: stride, pad, group
+            int stride = 1, pad = (w->ne[0] > 1) ? (int)(w->ne[0] / 2) : 0;
+            int group_n = 1;
             bool is_dw = (w->ne[2] == 1 && w->ne[3] > 1);
-            int pad = (w->ne[0] > 1) ? (int)(w->ne[0] / 2) : 0;
-            int stride = 1;
-            // TODO: read stride from graph metadata; default to 1
-            // For now, infer from spatial change (heuristic)
+            if (!n.attrs.empty()) {
+                sscanf(n.attrs.c_str(), "s%dp%dg%d", &stride, &pad, &group_n);
+                is_dw = (group_n > 1);
+            }
             if (is_dw) {
                 result = ggml_conv_2d_dw(g, w, x, stride, stride, pad, pad, 1, 1);
             } else {
