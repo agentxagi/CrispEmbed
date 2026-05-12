@@ -260,18 +260,34 @@ static bool load_model(crispembed_context * ctx, const char * path) {
         return k >= 0 ? gguf_get_val_f32(g, k) : def;
     };
 
-    hp.n_vocab         = u32("bert.vocab_size", 30522);
-    hp.n_max_tokens    = u32("bert.max_position_embeddings", 512);
-    hp.n_embd          = u32("bert.hidden_size", 384);
-    hp.n_head          = u32("bert.num_attention_heads", 12);
-    hp.n_layer         = u32("bert.num_hidden_layers", 6);
-    hp.n_intermediate  = u32("bert.intermediate_size", 1536);
+    // Hyperparams — check both CrispEmbed and Ollama key names.
+    // CrispEmbed: bert.hidden_size, bert.num_hidden_layers, ...
+    // Ollama:     bert.embedding_length, bert.block_count, ...
+    hp.n_vocab         = u32("bert.vocab_size", u32("bert.vocab_size", 30522));
+    hp.n_max_tokens    = u32("bert.max_position_embeddings", u32("bert.context_length", 512));
+    hp.n_embd          = u32("bert.hidden_size", u32("bert.embedding_length", 384));
+    hp.n_head          = u32("bert.num_attention_heads", u32("bert.attention.head_count", 12));
+    hp.n_layer         = u32("bert.num_hidden_layers", u32("bert.block_count", 6));
+    hp.n_intermediate  = u32("bert.intermediate_size", u32("bert.feed_forward_length", 1536));
     hp.n_output        = u32("bert.output_dim", hp.n_embd);
-    hp.layer_norm_eps  = f32("bert.layer_norm_eps", 1e-12f);
+    hp.layer_norm_eps  = f32("bert.layer_norm_eps",
+                             f32("bert.attention.layer_norm_epsilon", 1e-12f));
 
     // Pooling method: 0=mean (default), 1=cls, 2=last-token
-    // CrispEmbed format: bert.pooling_method; Ollama format: bert.pooling_type
-    ctx->pool_method   = u32("bert.pooling_method", u32("bert.pooling_type", 0));
+    // CrispEmbed format: bert.pooling_method (0=mean, 1=cls, 2=last)
+    // Ollama format:     bert.pooling_type   (0=none, 1=mean, 2=cls, 3=last)
+    {
+        int pm = u32("bert.pooling_method", -1);
+        if (pm < 0) {
+            // Try Ollama format and convert: Ollama{1=mean,2=cls,3=last} → CE{0,1,2}
+            int pt = u32("bert.pooling_type", -1);
+            // Also check arch-prefixed key (xlmr.pooling_type, bert.pooling_type)
+            if (pt < 0) pt = u32("xlmr.pooling_type", -1);
+            if (pt > 0) pm = pt - 1;  // Ollama 1→0(mean), 2→1(cls), 3→2(last)
+            else pm = 0;              // default mean
+        }
+        ctx->pool_method = pm;
+    }
     // Position embedding offset: 0 for BERT, 2 for RoBERTa/XLM-R
     ctx->pos_offset    = u32("bert.position_offset", 0);
     // ColBERT output dimension (BGE-M3 default 128) — read while g is valid
