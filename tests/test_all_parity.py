@@ -56,12 +56,12 @@ MODELS = {
     "multilingual-e5-small": ("intfloat/multilingual-e5-small", "mean", False, {}),
     "multilingual-e5-base": ("intfloat/multilingual-e5-base", "mean", False, {}),
     "multilingual-e5-large": ("intfloat/multilingual-e5-large", "mean", False, {}),
-    "pixie-rune-v1": ("telepix/PIXIE-Rune-v1.0", "mean", False, {}),
+    "pixie-rune-v1": ("telepix/PIXIE-Rune-v1.0", "cls", False, {}),
     "arctic-embed-l-v2": ("Snowflake/snowflake-arctic-embed-l-v2.0", "cls", False, {}),
     "paraphrase-multilingual-MiniLM-L12-v2": (
         "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", "mean", False, {}),
-    "snowflake-arctic-embed-m": ("Snowflake/snowflake-arctic-embed-m-v1.5", "cls", False, {}),
-    "snowflake-arctic-embed-l": ("Snowflake/snowflake-arctic-embed-l-v1.0", "cls", False, {}),
+    "snowflake-arctic-embed-m": ("Snowflake/snowflake-arctic-embed-m", "cls", False, {}),
+    "snowflake-arctic-embed-l": ("Snowflake/snowflake-arctic-embed-l", "cls", False, {}),
     "bge-m3": ("BAAI/bge-m3", "cls", False, {}),
 
     # ── NomicBERT (RoPE + SwiGLU) ──

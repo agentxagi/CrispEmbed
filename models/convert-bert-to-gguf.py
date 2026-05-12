@@ -543,13 +543,13 @@ def main():
         print(f"  Jina v2: post-LN, GELU FFN (no gate)")
 
     if is_nomic:
-        # NomicBERT: pre-LN, RoPE encoder, fused QKV, SwiGLU FFN, no bias on attn
-        # NomicBertBlock uses the flash-attn Block with prenorm=True pattern:
-        # residual + dropout(attn(norm1(residual))) → norm2 → MLP
+        # NomicBERT: POST-LN, RoPE encoder, fused QKV, SwiGLU FFN, no bias on attn
+        # NomicBertBlock has prenorm=False: attn → add → LN → MLP → add → LN
+        # (standard post-LN like BERT, despite the flash-attn Block wrapper)
         rope_theta = getattr(config, "rotary_emb_base", 10000.0)
         writer.add_float32("bert.rope_theta", rope_theta)
-        writer.add_uint32("bert.pre_ln", 1)
-        print(f"  NomicBERT: rope_theta={rope_theta}, pre_ln=1")
+        # Do NOT set pre_ln — this is post-LN
+        print(f"  NomicBERT: rope_theta={rope_theta}, post-LN")
 
     if is_modernbert:
         # ModernBERT: pre-LN, RoPE, GeGLU, fused QKV, fused gate+up, no biases
@@ -670,9 +670,13 @@ def main():
                 # Attention output (no bias in NomicBERT)
                 writer.add_tensor(f"{LP}.{i}.{TN['attn_o']}.weight", wt(sd[f"{pfx}.attn.out_proj.weight"]))
                 # SwiGLU FFN: keep SEPARATE gate + up (NomicBERT uses ggml_silu + ggml_mul)
-                writer.add_tensor(f"{LP}.{i}.{TN['ffn_up']}.weight", wt(sd[f"{pfx}.mlp.fc12.weight"]))
+                # HF NomicBERT: y = fc11(x) * activation(fc12(x))
+                #   fc11 = value/up (no activation), fc12 = gate (silu applied)
+                # Runtime: up = fc1_w * x; gate = silu(ffn_gate_w * x); ffn = up * gate
+                #   fc1 (ffn_up) must be fc11 (value), ffn_gate must be fc12 (gate)
+                writer.add_tensor(f"{LP}.{i}.{TN['ffn_up']}.weight", wt(sd[f"{pfx}.mlp.fc11.weight"]))
                 writer.add_tensor(f"{LP}.{i}.{TN['ffn_down']}.weight", wt(sd[f"{pfx}.mlp.fc2.weight"]))
-                writer.add_tensor(f"{LP}.{i}.ffn_gate.weight", wt(sd[f"{pfx}.mlp.fc11.weight"]))
+                writer.add_tensor(f"{LP}.{i}.ffn_gate.weight", wt(sd[f"{pfx}.mlp.fc12.weight"]))
 
         else:
             # BERT / DeBERTa / MPNet layer prefix
