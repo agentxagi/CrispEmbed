@@ -630,7 +630,7 @@ static ggml_tensor* replay_graph(
         // Try loading from weights (conv/bn params)
         // Clean name for GGUF lookup
         std::string clean = name;
-        for (char& c : clean) { if (c == '(' || c == ')') c = '_'; if (c == ' ') c = '_'; }
+        for (char& c : clean) { if (c == '(' || c == ')' || c == ',' || c == ' ') c = '_'; } std::string c2; for (size_t ci = 0; ci < clean.size(); ci++) { if (clean[ci] == '_' && ci + 1 < clean.size() && clean[ci+1] == '_') continue; c2 += clean[ci]; } clean = c2;
         auto wit = ctx->wl.tensors.find(clean);
         if (wit != ctx->wl.tensors.end()) return wit->second;
         // Try with original name
@@ -780,11 +780,16 @@ static ggml_tensor* replay_graph(
                 result = ggml_upscale(g, x, 2, GGML_SCALE_MODE_NEAREST);
             }
         } else if (n.op == "Concat") {
-            // Concat along channel axis (dim 2 in ggml [W,H,C])
-            if (n.inputs.size() >= 2) {
-                ggml_tensor* a = get_t(n.inputs[0]);
+            ggml_tensor* a = get_t(n.inputs[0]);
+            if (a && ggml_n_dims(a) >= 3 && n.inputs.size() >= 2) {
                 ggml_tensor* b = get_t(n.inputs[1]);
-                if (a && b) result = ggml_concat(g, a, b, 2);
+                if (b && ggml_n_dims(b) >= 3 && a->ne[0] == b->ne[0] && a->ne[1] == b->ne[1]) {
+                    result = ggml_concat(g, a, b, 2);
+                } else {
+                    result = a;  // shape mismatch or shape tensor — passthrough
+                }
+            } else {
+                if (a) result = a;  // shape tensor
             }
         } else if (n.op == "Transpose") {
             ggml_tensor* x = get_t(n.inputs[0]);
@@ -812,10 +817,9 @@ static ggml_tensor* replay_graph(
             ggml_tensor* x = get_t(n.inputs[0]);
             if (x) result = x;
         } else if (n.op == "Shape" || n.op == "Gather" || n.op == "Unsqueeze" || n.op == "Slice") {
-            // Shape manipulation ops — pass through for now
-            // These produce shape tensors used by Reshape, not needed for forward
-            ggml_tensor* x = get_t(n.inputs[0]);
-            if (x) result = x;
+            // Shape computation ops produce scalar/1D shape tensors for Resize.
+            // Don't register output — prevents confusion with feature tensors.
+            continue;
         }
 
         if (result) {
