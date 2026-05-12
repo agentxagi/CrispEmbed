@@ -661,15 +661,57 @@ static ggml_tensor* replay_graph(
                 }
             }
             if (!result) result = get_t(n.inputs[0]);  // fallback: pass through
-        } else if (n.op == "Reshape" || n.op == "Transpose" || n.op == "Shape" ||
-                   n.op == "Gather" || n.op == "Unsqueeze" || n.op == "Slice" ||
-                   n.op == "Concat" || n.op == "Resize" || n.op == "AveragePool" ||
-                   n.op == "MaxPool" || n.op == "Dropout" || n.op == "Sub") {
-            // Complex ops — pass through or skip for now
-            // These are needed for SCRFD output processing
-            // TODO: implement properly
+        } else if (n.op == "AveragePool" || n.op == "MaxPool") {
             ggml_tensor* x = get_t(n.inputs[0]);
-            if (x) result = x;  // pass through
+            if (x) {
+                int k = 3, s = 1, p = 0;
+                if (!n.attrs.empty()) sscanf(n.attrs.c_str(), "k%ds%dp%d", &k, &s, &p);
+                enum ggml_op_pool pool_op = (n.op == "MaxPool") ? GGML_OP_POOL_MAX : GGML_OP_POOL_AVG;
+                result = ggml_pool_2d(g, x, pool_op, k, k, s, s, p, p);
+            }
+        } else if (n.op == "Resize") {
+            ggml_tensor* x = get_t(n.inputs[0]);
+            if (x) {
+                // Nearest-neighbor 2x upscale (FPN standard)
+                result = ggml_upscale(g, x, 2, GGML_SCALE_MODE_NEAREST);
+            }
+        } else if (n.op == "Concat") {
+            // Concat along channel axis (dim 2 in ggml [W,H,C])
+            if (n.inputs.size() >= 2) {
+                ggml_tensor* a = get_t(n.inputs[0]);
+                ggml_tensor* b = get_t(n.inputs[1]);
+                if (a && b) result = ggml_concat(g, a, b, 2);
+            }
+        } else if (n.op == "Transpose") {
+            ggml_tensor* x = get_t(n.inputs[0]);
+            if (x) {
+                // Default: swap last two dims. Most SCRFD transposes are [N,C]→[C,N]
+                if (ggml_n_dims(x) == 2) {
+                    result = ggml_cont(g, ggml_transpose(g, x));
+                } else {
+                    result = x; // passthrough for higher dims (need specific perm)
+                }
+            }
+        } else if (n.op == "Reshape") {
+            ggml_tensor* x = get_t(n.inputs[0]);
+            if (x) {
+                // SCRFD reshapes are typically [1,C,H,W]→[H*W,C] or similar
+                // Without runtime shape inference, pass through
+                result = ggml_cont(g, x);
+            }
+        } else if (n.op == "Sub") {
+            ggml_tensor* a = get_t(n.inputs[0]);
+            ggml_tensor* b = get_t(n.inputs[1]);
+            if (a && b) result = ggml_sub(g, a, b);
+        } else if (n.op == "Dropout") {
+            // Identity at inference
+            ggml_tensor* x = get_t(n.inputs[0]);
+            if (x) result = x;
+        } else if (n.op == "Shape" || n.op == "Gather" || n.op == "Unsqueeze" || n.op == "Slice") {
+            // Shape manipulation ops — pass through for now
+            // These produce shape tensors used by Reshape, not needed for forward
+            ggml_tensor* x = get_t(n.inputs[0]);
+            if (x) result = x;
         }
 
         if (result) {
