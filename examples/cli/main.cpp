@@ -9,6 +9,7 @@
 #include "crispembed.h"
 #include "model_mgr.h"
 #include "vit_embed.h"
+#include "cnn_embed.h"
 
 #include <algorithm>
 #include <cmath>
@@ -97,6 +98,7 @@ int main(int argc, char ** argv) {
     std::string image_raw_path;  // preprocessed float32 patches, n_patches x 1536
     std::string grid_thw_arg;
     std::string image_path;  // JPG/PNG/BMP — in-process preprocessor
+    std::string face_path;   // face image for CNN face recognition
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
@@ -133,6 +135,8 @@ int main(int argc, char ** argv) {
             grid_thw_arg = argv[++i];
         } else if (strcmp(argv[i], "--image") == 0 && i + 1 < argc) {
             image_path = argv[++i];
+        } else if (strcmp(argv[i], "--face") == 0 && i + 1 < argc) {
+            face_path = argv[++i];
         } else if (strcmp(argv[i], "--auto-download") == 0) {
             auto_download = true;
         } else if (strcmp(argv[i], "--list-models") == 0) {
@@ -192,6 +196,36 @@ int main(int argc, char ** argv) {
         while (std::getline(f, line)) {
             if (!line.empty()) texts.push_back(line);
         }
+    }
+
+    // Check if this is a CNN face model (SFace/AuraFace/SCRFD).
+    if (!face_path.empty() || print_dim) {
+        cnn_embed::context* cctx = nullptr;
+        if (cnn_embed::load(&cctx, model_path.c_str(), n_threads)) {
+            if (print_dim) {
+                printf("%d\n", cnn_embed::dim(cctx));
+                cnn_embed::free(cctx);
+                return 0;
+            }
+            auto emb = cnn_embed::encode_file(cctx, face_path.c_str());
+            if (emb.empty()) {
+                fprintf(stderr, "error: face encoding failed for '%s'\n", face_path.c_str());
+                cnn_embed::free(cctx);
+                return 1;
+            }
+            if (json_output) {
+                printf("{\"face\": \"%s\", \"embedding\": [", json_escape(face_path).c_str());
+                for (size_t j = 0; j < emb.size(); j++)
+                    printf("%.6f%s", emb[j], j + 1 < emb.size() ? ", " : "");
+                printf("]}\n");
+            } else {
+                for (size_t j = 0; j < emb.size(); j++)
+                    printf("%.6f%s", emb[j], j + 1 < emb.size() ? " " : "\n");
+            }
+            cnn_embed::free(cctx);
+            return 0;
+        }
+        // Not a CNN model — fall through
     }
 
     // Check if this is a standalone ViT GGUF (SigLIP/CLIP image encoder).
