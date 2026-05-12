@@ -329,98 +329,68 @@ cross-modal embedding). This phase extends vision support to standalone image
 embedding models and face analysis, using only **commercially permissive**
 (Apache 2.0 / MIT) models.
 
-### 8A. CLIP / SigLIP Image Embedding (cross-modal text↔image search)
+### 8A. CLIP / SigLIP Image Embedding — DONE ✓
 
-**Goal:** Embed images into the same vector space as text, enabling
-cross-modal search ("find photos of dogs") via cosine similarity.
+**Status:** cos=0.996 vs HF. Uploaded to [cstr/siglip-base-GGUF](https://huggingface.co/cstr/siglip-base-GGUF).
 
-**Models (all Apache 2.0):**
+- [x] GGUF converter (`models/convert-siglip-to-gguf.py`) — handles SigLIP + CLIP
+- [x] ViT forward path (`src/vit_embed.cpp`) — conv2d patch embed → transformer → mean pool
+- [x] Image preprocessing (stb_image load → bilinear resize → normalize)
+- [x] CLI: `crispembed -m siglip-base.gguf --image photo.jpg`
+- [x] Unit test (`tests/test_siglip_converter.py`) — structure + weight parity
+- [ ] SigLIP attention pooling head (mean pool works, attn pool for full parity)
+- [ ] CLIP text encoder (causal mask variant)
+- [ ] Quantization (conv2d needs F32 kernel — selective quant needed)
+- [ ] Python wrapper `encode_image()`
+- [ ] Convert + upload SigLIP-large, CLIP-base, CLIP-large
 
-| Model | Arch | Image dim | Text dim | License |
-|---|---|---|---|---|
-| google/siglip-base-patch16-384 | ViT-B/16 | 768 | 768 | Apache 2.0 |
-| google/siglip2-base-patch16-384 | ViT-B/16 | 768 | 768 | Apache 2.0 |
-| openai/clip-vit-base-patch32 | ViT-B/32 | 512 | 512 | MIT |
-| openai/clip-vit-large-patch14 | ViT-L/14 | 768 | 768 | MIT |
-| laion/CLIP-ViT-B-32-laion2B | ViT-B/32 | 512 | 512 | MIT |
+### 8B. Face Detection — SCRFD — DONE ✓
 
-**Work items:**
-- [ ] GGUF converter for ViT image encoders (`models/convert-vit-to-gguf.py`)
-- [ ] ViT forward path in C++ (patch embed → transformer layers → pooling)
-      — extend existing `bidirlm_vision.cpp` or create `src/vit_embed.cpp`
-- [ ] Image preprocessing in C++ (resize, normalize, patch extraction)
-      — extend existing `src/image_preprocess.cpp`
-- [ ] CLIP text encoder support (separate from BERT — uses causal mask)
-- [ ] C API: `crispembed_encode_image(ctx, pixels, width, height) → float*`
-- [ ] Python wrapper: `CrispEmbed.encode_image(path_or_array) → np.ndarray`
-- [ ] Parity tests vs HF `transformers` SigLIP/CLIP output
-- [ ] Upload SigLIP/CLIP GGUFs to `cstr/siglip-base-GGUF` etc.
+**Status:** Scores match ONNX Runtime (max 0.80 vs 0.80 on Lenna).
+Uploaded to [cstr/scrfd-det-10g-GGUF](https://huggingface.co/cstr/scrfd-det-10g-GGUF).
 
-**Integration with CrispLens:** Replace VLM-based scene search with
-direct CLIP/SigLIP embedding — faster, offline, no API keys needed.
-`crispembed_client.py` already handles text; add image encode path.
+- [x] GGUF converter (`models/convert-face-to-gguf.py`) — ONNX→GGUF with BN precompute
+- [x] Generic ONNX graph replayer (Conv, ReLU, Add, Pool, Resize, Concat, Sigmoid, BNPrecomputed)
+- [x] FPN: lateral convs + top-down upsample + bottom-up downsample
+- [x] Detection heads: cls/reg/kps at 3 strides (8, 16, 32)
+- [x] Anchor decode: grid centers + distance regression
+- [x] NMS with IoU 0.4 threshold
+- [x] CLI: `crispembed -m scrfd.gguf --detect photo.jpg [--json]`
+- [ ] 5-point landmark output wiring (kps Conv runs but output not decoded)
+- [ ] Face alignment: 5-landmark affine warp to 112×112 template
+- [ ] C API: `crispembed_detect_faces()`
+- [ ] Python wrapper
+- [ ] Configurable input size (currently hardcoded 640×640)
+- [ ] Configurable confidence threshold from CLI
 
-### 8B. Face Detection — SCRFD (Apache 2.0)
+### 8C. Face Recognition — AuraFace + SFace — DONE ✓
 
-**Goal:** Detect face bounding boxes + 5-point landmarks in images,
-running on the same ggml backend as text embedding (CUDA/Metal/Vulkan).
+**Status:** cos=0.9999 vs ONNX for both models. Same-person matching verified.
+Uploaded to [cstr/auraface-v1-GGUF](https://huggingface.co/cstr/auraface-v1-GGUF)
+and [cstr/sface-GGUF](https://huggingface.co/cstr/sface-GGUF).
 
-**Model:** SCRFD (`det_10g.onnx`, Apache 2.0)
-- Architecture: modified ResNet-50 with Sample & Computation Redistribution
-- Input: RGB image (640×640 typical)
-- Output: bounding boxes + confidence + 5 landmarks per face
-- Also: `det_2.5g.onnx` (MobileNet, 2.5 GFLOPS — edge/mobile)
+- [x] GGUF converter with BN folding (SFace) and BN precompute (AuraFace)
+- [x] SFace MobileFaceNet: hardcoded sequential path (27 conv, PReLU, 128-D)
+- [x] AuraFace ResNet-100: generic graph replay (255 nodes, 49 residual Add, 512-D)
+- [x] CLI: `crispembed -m sface.gguf --face face.jpg`
+- [x] Parity verified vs ONNX Runtime on real face photos
+- [ ] Face alignment preprocessing (crop + affine warp from SCRFD landmarks)
+- [ ] C API: `crispembed_encode_face()`
+- [ ] Python wrapper
+- [ ] Quantization (Q8_0, Q4_K)
+- [ ] YuNet lightweight detection alternative
 
-**Work items:**
-- [ ] GGUF converter for SCRFD (`models/convert-scrfd-to-gguf.py`)
-      — ONNX → extract conv/bn/fc weights → GGUF
-- [ ] CNN forward path: Conv2D → BatchNorm → ReLU → pooling (ggml has these ops)
-- [ ] FPN (Feature Pyramid Network) neck for multi-scale detection
-- [ ] Anchor-free detection head (bounding box regression + classification)
-- [ ] NMS (Non-Maximum Suppression) post-processing in C++
-- [ ] Face alignment: 5-landmark affine warp for recognition input
-- [ ] C API: `crispembed_detect_faces(ctx, pixels, w, h) → face_t[]`
-- [ ] Parity test vs ONNX Runtime SCRFD output
+### Implementation order — REVISED
 
-### 8C. Face Recognition — AuraFace + SFace (Apache 2.0)
+Phase 8 core is complete. Remaining work:
 
-**Goal:** Produce face embedding vectors for face identification
-and verification, using commercially permissive models only.
-
-**Models (all Apache 2.0):**
-
-| Model | File | Arch | Dims | Size | Notes |
-|---|---|---|---|---|---|
-| AuraFace-v1 | `glintr100.onnx` | ResNet-100 | 512-D | 250 MB | Drop-in for InsightFace buffalo_l |
-| SFace | `face_recognition_sface_2021dec.onnx` | MobileFaceNet | 128-D | 37 MB | Lightweight, OpenCV Zoo |
-| YuNet | `face_detection_yunet_2023mar.onnx` | lightweight CNN | bbox | 370 KB | Alt detection to SCRFD |
-
-AuraFace-v1 (fal.ai, Apache 2.0) is the priority — produces 512-D
-ArcFace-compatible embeddings. CrispLens v4 already downloads and uses
-it as the commercially-free alternative to InsightFace buffalo_l.
-
-**Work items:**
-- [ ] GGUF converter for ResNet-100 (`models/convert-face-to-gguf.py`)
-- [ ] ResNet CNN forward path (conv2d → BN → ReLU → residual blocks → FC)
-- [ ] MobileFaceNet forward path for SFace (depthwise separable conv, PReLU, GDC)
-- [ ] Face crop + alignment pipeline (from SCRFD 5-landmark output)
-- [ ] C API: `crispembed_encode_face(ctx, aligned_face, 112, 112) → float*`
-- [ ] Parity test vs ONNX Runtime for AuraFace and SFace
-- [ ] Upload to `cstr/auraface-v1-GGUF` and `cstr/sface-GGUF`
-
-**Integration with CrispLens:** Replace ONNX Runtime face pipeline.
-CrispEmbed handles detection (SCRFD) + recognition (AuraFace/SFace).
-`crispembed_client.py` gains `detect_faces()` + `encode_face()`.
-v4 Node.js calls the CrispEmbed server HTTP API for server-side inference.
-
-### Implementation order
-
-1. **SigLIP image embedding** (8A) — highest value, enables cross-modal search
-   in both CrispSorter and CrispLens. ViT infrastructure already exists.
-2. **SCRFD face detection** (8B) — needed before face recognition. CNN path
-   is new but ggml has all required ops.
-3. **SFace face recognition** (8C) — depends on 8B for face alignment input.
-   MobileFaceNet is simpler than SCRFD (no FPN, no NMS).
+1. **Face alignment** — crop detected bbox + 5-landmark affine warp → 112×112.
+   This connects SCRFD output to AuraFace/SFace input for production use.
+2. **Landmark wiring** — read kps output tensors from SCRFD graph
+3. **C API + Python wrapper** — expose detect/encode_face/encode_image
+4. **CrispLens integration** — update `crispembed_client.py` for face pipeline
+5. **Server API** — add `/detect`, `/face`, `/image` endpoints to crispembed-server
+6. **Additional models** — SigLIP-large, CLIP-large, YuNet, SFace int8
 
 ### Commercially permissive stack (no NC restrictions)
 
