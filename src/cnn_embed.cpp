@@ -494,6 +494,7 @@ std::vector<face_detection> detect(context* ctx, const float* pixels, int H, int
         ggml_tensor* bbox_t = ggml_graph_get_tensor(gf, bbox_buf);
         ggml_tensor* kps_t = ggml_graph_get_tensor(gf, kps_buf);
 
+        fprintf(stderr, "  stride %d: score=%s bbox=%s kps=%s\n", stride, score_t?"ok":"MISS", bbox_t?"ok":"MISS", kps_t?"ok":"MISS");
         if (!score_t || !bbox_t) {
             fprintf(stderr, "cnn_embed: stride %d outputs not found\n", stride);
             continue;
@@ -515,24 +516,30 @@ std::vector<face_detection> detect(context* ctx, const float* pixels, int H, int
         if (kps_t) {
             int kps_n = (int)ggml_nelements(kps_t);
             kps_data.resize(kps_n);
+            fprintf(stderr, "  kps stride %d: n=%d min=%.4f max=%.4f\n", stride, kps_n, *std::min_element(kps_data.begin(), kps_data.end()), *std::max_element(kps_data.begin(), kps_data.end()));
             ggml_backend_tensor_get(kps_t, kps_data.data(), 0, kps_n * sizeof(float));
+            { float mn=1e9,mx=-1e9; for(float v:kps_data){mn=std::min(mn,v);mx=std::max(mx,v);} fprintf(stderr,"  kps[%d]: min=%.4f max=%.4f\n",stride,mn,mx); }
         }
 
-        // Decode anchors
+        // Decode anchors — conv output layout [W, H, C] where C = num_anchors * values
+        // Score: [W, H, 2] → 2 anchors per loc, 1 score each
+        // Bbox:  [W, H, 8] → 2 anchors × 4 distances
+        // Kps:   [W, H, 20] → 2 anchors × 5 points × 2 coords
         int idx = 0;
         for (int row = 0; row < grid_h; row++) {
             for (int col = 0; col < grid_w; col++) {
                 for (int a = 0; a < num_anchors_per_loc; a++, idx++) {
-                    if (idx >= n_total) break;
-                    // Score (already through sigmoid in graph)
-                    float score = scores[idx];
+                    // Score in conv layout: [col, row, anchor]
+                    int si_idx = (row * grid_w + col) * num_anchors_per_loc + a;
+                    if (si_idx >= n_total) break;
+                    float score = scores[si_idx];
                     if (score < conf_threshold) continue;
 
                     float cx = (col + 0.5f) * stride;
                     float cy = (row + 0.5f) * stride;
 
-                    // Bbox: [left, top, right, bottom] distances from anchor center
-                    int bi = idx * 4;
+                    // Bbox: 4 distances per anchor in conv layout
+                    int bi = (row * grid_w + col) * (num_anchors_per_loc * 4) + a * 4;
                     if (bi + 3 >= bbox_n) continue;
                     float x1 = cx - bboxes[bi + 0] * stride;
                     float y1 = cy - bboxes[bi + 1] * stride;
@@ -548,8 +555,10 @@ std::vector<face_detection> detect(context* ctx, const float* pixels, int H, int
                     memset(det.landmarks, 0, sizeof(det.landmarks));
 
                     // Keypoints: 5 × (dx, dy) relative to anchor center
+                    // kps tensor is in conv output layout [W, H, 20] (ggml ne[0]=W)
+                    // 20 = 2 anchors × 5 points × 2 coords
                     if (!kps_data.empty()) {
-                        int ki = idx * 10;
+                        int ki = (row * grid_w + col) * 20 + a * 10;
                         for (int k = 0; k < 5 && ki + k*2+1 < (int)kps_data.size(); k++) {
                             det.landmarks[k*2]   = cx + kps_data[ki + k*2]   * stride;
                             det.landmarks[k*2+1] = cy + kps_data[ki + k*2+1] * stride;
