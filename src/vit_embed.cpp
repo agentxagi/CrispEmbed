@@ -226,21 +226,26 @@ std::vector<float> encode(context* ctx, const float* pixels, int H, int W) {
     ggml_set_name(pixel_in, "pixels");
     ggml_set_input(pixel_in);
 
-    // Patch embedding via conv2d: [D, C, ps, ps] * [C, H, W] → [D, grid, grid]
+    // Patch embedding via conv2d
+    // Input pixels: [W, H, C] in ggml layout (ne[0]=W, ne[1]=H, ne[2]=C)
+    // Kernel: [kw, kh, C_in, C_out] in ggml
+    // Output: [OW, OH, C_out] where OW = OH = grid
     ggml_tensor* x = ggml_conv_2d(g, ctx->patch_embed_w, pixel_in,
                                    ps, ps, 0, 0, 1, 1);
+    // x shape: [grid, grid, D] = [24, 24, 768]
+
     if (ctx->patch_embed_b) {
-        // Reshape bias [D] → [D, 1, 1] for broadcast
-        ggml_tensor* bias_3d = ggml_reshape_3d(g, ctx->patch_embed_b, 1, 1, D);
-        x = ggml_add(g, x, bias_3d);
+        // bias [D] broadcasts over spatial dims (ggml_add repeats ne[0] match)
+        x = ggml_add(g, x, ggml_reshape_3d(g, ctx->patch_embed_b, 1, 1, D));
     }
 
-    // Reshape [D, grid, grid] → [D, T]
-    x = ggml_reshape_2d(g, x, D, T);
+    // Reshape [grid, grid, D] → [D, T] where T = grid*grid
+    // In ggml: ne[0]=grid, ne[1]=grid, ne[2]=D → cont + reshape to ne[0]=D, ne[1]=T
+    x = ggml_cont(g, ggml_permute(g, x, 2, 0, 1, 3));  // [D, grid, grid]
+    x = ggml_reshape_2d(g, x, D, T);                     // [D, T]
 
-    // Add position embeddings: pos_embd is [T, D] in row-major → need [D, T]
-    ggml_tensor* pos = ggml_cont(g, ggml_transpose(g, ctx->pos_embd));
-    x = ggml_add(g, x, pos);
+    // Position embeddings: pos_embd stored as [D, T] (from converter)
+    x = ggml_add(g, x, ctx->pos_embd);
 
     // Pre-LN (CLIP only)
     if (ctx->pre_ln_w) {
@@ -313,13 +318,12 @@ std::vector<float> encode(context* ctx, const float* pixels, int H, int W) {
     }
 
     // Pooling: mean over patches. x is [D, T].
-    // ggml_mean reduces all dims; we want mean over dim 1 (patches).
-    // Use: sum_rows → scale(1/T).
-    // ggml_sum_rows: sums over ne[0] → [1, T]. We need sum over ne[1].
-    // Alternative: transpose [T, D] → sum_rows → [1, D] → reshape [D].
+    // ggml_mean reduces ALL dims to a scalar — not what we want.
+    // ggml_sum_rows sums over ne[0] → [1, T].
+    // We need sum over ne[1] (T dim). Transpose first.
     ggml_tensor* xt = ggml_cont(g, ggml_transpose(g, x));  // [T, D]
-    ggml_tensor* pooled = ggml_sum_rows(g, xt);  // [1, D]
-    pooled = ggml_reshape_1d(g, pooled, D);
+    ggml_tensor* summed = ggml_sum_rows(g, xt);  // [1, D] — sums T values per D component
+    ggml_tensor* pooled = ggml_reshape_1d(g, summed, D);
     pooled = ggml_scale(g, pooled, 1.0f / (float)T);
 
     // Visual projection (CLIP)
