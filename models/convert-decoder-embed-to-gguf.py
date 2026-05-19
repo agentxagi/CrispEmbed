@@ -57,6 +57,16 @@ def main():
     parser.add_argument("--model", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--dtype", choices=["f16", "f32", "q8_0"], default="f32")
+    parser.add_argument("--load-dtype",
+                        choices=["bfloat16", "float16", "float32"],
+                        default="bfloat16",
+                        help="Precision used to load HF weights into RAM. "
+                             "Does NOT affect the output GGUF dtype (use "
+                             "--dtype for that). Default bfloat16 halves "
+                             "peak RAM vs float32 — required for 8B+ models "
+                             "on 16 GB hosts like Kaggle. Use float32 only "
+                             "if the upstream model's saved weights are f32 "
+                             "and you want exact round-trip.")
     fmt_group = parser.add_mutually_exclusive_group()
     fmt_group.add_argument("--ollama", action="store_true", default=True,
                            help="Ollama-compatible naming (default)")
@@ -73,13 +83,22 @@ def main():
     else:
         wt = f32
 
-    print(f"Loading: {args.model}")
+    print(f"Loading: {args.model}  (load_dtype={args.load_dtype})")
+    import torch
+    load_dtype = {"bfloat16": torch.bfloat16,
+                  "float16":  torch.float16,
+                  "float32":  torch.float32}[args.load_dtype]
     config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
+    # `low_cpu_mem_usage=True` initializes on meta-device then loads weights
+    # directly into the target dtype — avoids the float32 double-allocation
+    # that OOM-kills 8B+ models on small hosts (Kaggle, 16 GB Macs, etc.).
+    load_kwargs = dict(trust_remote_code=True, torch_dtype=load_dtype,
+                       low_cpu_mem_usage=True)
     try:
-        model = AutoModel.from_pretrained(args.model, trust_remote_code=True,
-                                          use_safetensors=True)
+        model = AutoModel.from_pretrained(args.model, use_safetensors=True,
+                                          **load_kwargs)
     except Exception:
-        model = AutoModel.from_pretrained(args.model, trust_remote_code=True)
+        model = AutoModel.from_pretrained(args.model, **load_kwargs)
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     model.eval()
 
