@@ -2507,6 +2507,9 @@ static float crispembed_apply_classifier(crispembed_context * ctx,
 // Batch rerank: score multiple documents against the same query.
 // Runs the encoder for each pair sequentially (same as single rerank)
 // but caches classifier weights so only the encoder forward pass repeats.
+// Forward declaration — defined below.
+static std::vector<float> run_encoder_raw_batch(crispembed_context * ctx, const std::vector<embed_tokens> & batch_tokens, int max_T, int * out_T);
+
 extern "C" int crispembed_rerank_batch(crispembed_context * ctx,
                                         const char         * query,
                                         const char        ** documents,
