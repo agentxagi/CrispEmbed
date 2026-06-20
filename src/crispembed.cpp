@@ -2549,33 +2549,175 @@ extern "C" int crispembed_rerank_batch(crispembed_context * ctx,
         ctx->rerank_cache_valid = true;
     }
 
-    int scored = 0;
+    // Warm cache done above. Now batch-tokenize all pairs and run encoder once.
+    std::vector<embed_tokens> all_tokens(n_docs);
+    int max_T = 0;
     for (int d = 0; d < n_docs; d++) {
-        if (!documents[d]) { out_scores[d] = 0.0f; scored++; continue; }
-
-        embed_tokens tokens;
+        if (!documents[d]) { all_tokens[d].ids.clear(); continue; }
         if (ctx->use_sentencepiece)
-            tokens = ctx->sp_tokenizer.encode_pair(query, documents[d]);
+            all_tokens[d] = ctx->sp_tokenizer.encode_pair(query, documents[d]);
         else
-            tokens = ctx->wp_tokenizer.encode_pair(query, documents[d]);
+            all_tokens[d] = ctx->wp_tokenizer.encode_pair(query, documents[d]);
 
+        // Trim trailing padding
         int T = 0;
-        for (int i = (int)tokens.attn_mask.size() - 1; i >= 0; i--) {
-            if (tokens.attn_mask[i]) { T = i + 1; break; }
+        for (int i = (int)all_tokens[d].attn_mask.size() - 1; i >= 0; i--) {
+            if (all_tokens[d].attn_mask[i]) { T = i + 1; break; }
         }
-        if (T == 0) { out_scores[d] = 0.0f; scored++; continue; }
-        tokens.ids.resize(T);
-        tokens.type_ids.resize(T);
-        tokens.attn_mask.resize(T);
+        all_tokens[d].ids.resize(T);
+        all_tokens[d].type_ids.resize(T);
+        all_tokens[d].attn_mask.resize(T);
+        max_T = std::max(max_T, T);
+    }
 
+    if (max_T == 0) return 0;
+
+    // Cap batch size to avoid VRAM overflow (each seq uses H * max_T * 4 bytes)
+    // With H=1024, max_T=256, B=30: 1024*256*30*4 = 30MB — safe
+    const int MAX_BATCH = 32;
+    int scored = 0;
+
+    for (int batch_start = 0; batch_start < n_docs; batch_start += MAX_BATCH) {
+        int batch_end = std::min(batch_start + MAX_BATCH, n_docs);
+        int B = batch_end - batch_start;
+
+        std::vector<embed_tokens> batch_tokens(all_tokens.begin() + batch_start,
+                                                all_tokens.begin() + batch_end);
+
+        // Run batched encoder forward pass
         int raw_T = 0;
-        std::vector<float> raw = run_encoder_raw(ctx, tokens, 0, &raw_T);
-        if (raw.empty()) { out_scores[d] = 0.0f; scored++; continue; }
+        std::vector<float> raw = run_encoder_raw_batch(ctx, batch_tokens, max_T, &raw_T);
 
-        out_scores[d] = crispembed_apply_classifier(ctx, raw.data(), raw_T);
-        scored++;
+        if (raw.empty()) {
+            // Fallback to sequential for this batch
+            for (int d = batch_start; d < batch_end; d++) {
+                if (all_tokens[d].ids.empty()) { out_scores[d] = 0.0f; scored++; continue; }
+                std::vector<float> single = run_encoder_raw(ctx, all_tokens[d], 0, nullptr);
+                out_scores[d] = single.empty() ? 0.0f : crispembed_apply_classifier(ctx, single.data(), (int)all_tokens[d].ids.size());
+                scored++;
+            }
+            continue;
+        }
+
+        // Extract CLS (position 0) for each batch item and apply classifier
+        const int H = ctx->model.hparams.n_embd;
+        for (int b = 0; b < B; b++) {
+            int doc_idx = batch_start + b;
+            if (all_tokens[doc_idx].ids.empty()) { out_scores[doc_idx] = 0.0f; scored++; continue; }
+
+            // CLS is at offset b * max_T * H in the [H, max_T * B] output
+            // ggml tensor layout: ne[0]=H (contiguous), ne[1]=max_T*B
+            // So element (h, t) is at index h + t * H
+            // CLS for batch b is token 0 → position b * max_T in the T dimension
+            // → offset b * max_T * H
+            const float * cls_vec = raw.data() + (int64_t)b * max_T * H;
+            out_scores[doc_idx] = crispembed_apply_classifier(ctx, cls_vec, max_T);
+            scored++;
+        }
     }
     return scored;
+}
+
+// Batched encoder forward pass: process B sequences of up to max_T tokens.
+// Pads shorter sequences with PAD token (id 1 for XLM-R, 0 for BERT).
+// Returns [H * max_T * B] raw encoder output — extract CLS per item.
+//
+// Each sequence is padded to max_T. For XLM-R/BERT (non-DeBERTa), the
+// attention naturally attenuates for padding tokens since their embeddings
+// are near-zero (only position + type embeddings contribute). This is the
+// standard behavior when no explicit attention mask is applied.
+static std::vector<float> run_encoder_raw_batch(
+    crispembed_context * ctx,
+    const std::vector<embed_tokens> & batch_tokens,
+    int max_T,
+    int * out_T)
+{
+    const int B = (int)batch_tokens.size();
+    if (B == 0 || max_T <= 0) return {};
+    if (out_T) *out_T = max_T;
+
+    // Get PAD token ID (1 for XLM-R/RoBERTa, 0 for BERT)
+    int pad_token_id = ctx->use_sentencepiece ? 1 : 0;
+    // Also detect if it's stored in GGUF metadata
+    // (fallback to hardcoded values above)
+
+    const int TB = max_T * B;
+    int T_bucket = bucket_seq_len(max_T);
+
+    // Reserve scheduler if needed
+    int & reserved = ctx->reserved_T;
+    if (reserved != T_bucket) {
+        ggml_cgraph * measure_gf = build_encoder_graph(ctx, T_bucket, 1, 0);
+        ggml_backend_sched_reserve(ctx->sched, measure_gf);
+        reserved = T_bucket;
+    }
+
+    // Build graph with B > 1
+    ggml_cgraph * gf = build_encoder_graph(ctx, max_T, B, 0);
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        fprintf(stderr, "crispembed: batch graph alloc failed (B=%d, T=%d)\n", B, max_T);
+        return {};
+    }
+
+    // Prepare flattened token IDs [max_T * B] with padding
+    std::vector<int32_t> tok_data(TB, pad_token_id);
+    std::vector<int32_t> pos_data(TB);
+    std::vector<int32_t> type_data(TB, 0);
+
+    for (int b = 0; b < B; b++) {
+        const auto & tokens = batch_tokens[b];
+        const int n_real = std::min((int)tokens.ids.size(), max_T);
+        for (int t = 0; t < n_real; t++) {
+            int idx = b * max_T + t;
+            tok_data[idx] = tokens.ids[t];
+            pos_data[idx] = t + ctx->pos_offset;
+            type_data[idx] = (t < (int)tokens.type_ids.size()) ? tokens.type_ids[t] : 0;
+        }
+        // Fill padding positions with valid position IDs (so RoPE/pos_embd don't crash)
+        for (int t = n_real; t < max_T; t++) {
+            int idx = b * max_T + t;
+            pos_data[idx] = t + ctx->pos_offset;
+        }
+    }
+
+    // Set inputs
+    ggml_tensor * tok_ids = ggml_graph_get_tensor(gf, "tok_ids");
+    if (!tok_ids) return {};
+    ggml_backend_tensor_set(tok_ids, tok_data.data(), 0, TB * sizeof(int32_t));
+
+    ggml_tensor * pos_ids = ggml_graph_get_tensor(gf, "pos_ids");
+    if (pos_ids) {
+        ggml_backend_tensor_set(pos_ids, pos_data.data(), 0, TB * sizeof(int32_t));
+    }
+
+    if (ctx->model.type_embd) {
+        ggml_tensor * type_ids = ggml_graph_get_tensor(gf, "type_ids");
+        if (type_ids) {
+            ggml_backend_tensor_set(type_ids, type_data.data(), 0, TB * sizeof(int32_t));
+        }
+    }
+
+    // Compute
+    if (!sched_graph_compute(ctx->sched, gf, ctx->n_threads)) {
+        fprintf(stderr, "crispembed: batch compute failed (B=%d)\n", B);
+        return {};
+    }
+
+    // Read output: graph produces [H, max_T * B] after final reshape_2d
+    // CLS token for batch item b is at position b * max_T * H (first token of each sequence)
+    const int H = ctx->model.hparams.n_embd;
+    ggml_tensor * out = ggml_graph_get_tensor(gf, "encoder_out");
+    if (!out) {
+        // Try to get from the last node
+        out = ggml_graph_node(gf, -1);
+    }
+    if (!out) return {};
+
+    std::vector<float> output(H * max_T * B);
+    ggml_backend_tensor_get(out, output.data(), 0, output.size() * sizeof(float));
+
+    return output;
 }
 
 // ---------------------------------------------------------------------------
