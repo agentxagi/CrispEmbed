@@ -3785,7 +3785,15 @@ extern "C" int crispembed_rerank_batch(crispembed_context * ctx, const char * qu
     // O caminho em lote só entra por opção explícita (CRISPEMBED_RERANK_BATCH_MASKED=1) e
     // depois de o classificador estar em cache — que é o bloco acima. Com a bandeira
     // desligada, o laço sequencial abaixo permanece byte a byte o de antes.
-    if (rerank_batch_enabled(ctx) && n_docs > 1) {
+    // Auto-threshold: com poucos documentos o custo fixo do grafo agrupado supera o
+    // ganho (medido: p50 45->53 ms nos casos pequenos do portao). So compensa quando
+    // ha fila que amortize; o piso e ajustavel para A/B.
+    int min_docs = 16;
+    if (const char * v = std::getenv("CRISPEMBED_RERANK_BATCH_MIN_DOCS")) {
+        const int n = atoi(v);
+        if (n > 1) min_docs = n;
+    }
+    if (rerank_batch_enabled(ctx) && n_docs >= min_docs) {
         return rerank_scored_batched(ctx, query, documents, n_docs, out_scores);
     }
     for (int d = 0; d < n_docs; d++) {
