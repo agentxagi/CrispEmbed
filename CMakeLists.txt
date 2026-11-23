@@ -420,7 +420,7 @@ list(APPEND CRISPEMBED_SOURCES src/lighton4b_physical_gdn_source_ops.cpp src/lig
 list(APPEND CRISPEMBED_SOURCES src/lighton4b_physical_f16_attention.cpp)
 # Experimental MiniCPM-OCR-1.0 (default-off: CRISPEMBED_MINICPM_OCR); reuses the qwen35 decoder.
 list(APPEND CRISPEMBED_SOURCES src/minicpm_ocr_vision.cpp src/minicpm_ocr.cpp src/qwen35_graph_decoder.cpp
-     src/qwen35_graph_kv_decoder.cpp src/qwen35_ocr_gpu.cpp)
+     src/qwen35_graph_kv_decoder.cpp src/qwen35_ocr_gpu.cpp src/pplx_contextual.cpp)
 list(APPEND CRISPEMBED_SOURCES src/tesseract_lstm.cpp)
 list(APPEND CRISPEMBED_SOURCES src/tesseract_recoder.cpp src/tesseract_dawg_score.cpp)
 list(APPEND CRISPEMBED_SOURCES src/tesseract_dawg.cpp src/tesseract_dawg_legacy.cpp)
