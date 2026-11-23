@@ -19,6 +19,7 @@
 #include "core/gpu_backend_pref.h"
 #include "ocr_pipeline.h"
 #include "core/env_gate.h"
+#include "core/env_value.h"
 
 #include <algorithm>
 #include <atomic>
@@ -3859,6 +3860,164 @@ static float crispembed_apply_classifier(crispembed_context * ctx, const float *
 // Batch rerank: score multiple documents against the same query.
 // Runs the encoder for each pair sequentially (same as single rerank)
 // but caches classifier weights so only the encoder forward pass repeats.
+//
+// Opt-in masked batched encoder (`CRISPEMBED_RERANK_BATCH_MASKED=1`): length-sorts
+// (query, document) pairs and scores each group of `CRISPEMBED_RERANK_BATCH_GROUP`
+// (default 8) as a single ggml graph with per-item `pad_mask [T_max, T_max, 1, B]`,
+// engaging when `n_docs >= CRISPEMBED_RERANK_BATCH_MIN_DOCS` (default 16).
+static bool rerank_batch_enabled(const crispembed_context * ctx) {
+    if (!ctx || ctx->is_decoder) return false;
+    if (!ctx->model.is_reranker) return false;
+    if (ctx->model.rel_attn_bias || ctx->model.rel_embd || ctx->use_rope) return false;
+    return core_env::on("CRISPEMBED_RERANK_BATCH_MASKED");
+}
+
+static int rerank_batch_group_size(void) {
+    if (const char * v = core_env::value("CRISPEMBED_RERANK_BATCH_GROUP")) {
+        const int n = std::atoi(v);
+        if (n > 0) return n;
+    }
+    return 8;
+}
+
+static std::vector<std::vector<float>> run_encoder_cls_group(
+        crispembed_context * ctx, const std::vector<embed_tokens> & group) {
+    const auto & hp = ctx->model.hparams;
+    const int B = (int)group.size();
+    const int H = hp.n_embd;
+    int T_max = 0;
+    for (const auto & t : group) T_max = std::max(T_max, (int)t.ids.size());
+    if (B == 0 || T_max == 0) return {};
+    const size_t TB = (size_t)T_max * B;
+
+    ggml_cgraph * gf = build_encoder_graph(ctx, T_max, B, 0, /*packed_mask=*/false, /*item_mask=*/true);
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        fprintf(stderr, "crispembed: rerank batch graph alloc failed (B=%d, T=%d)\n", B, T_max);
+        return {};
+    }
+
+    std::vector<int32_t> tok_data(TB, 0), pos_data(TB, ctx->pos_offset);
+    for (int b = 0; b < B; b++) {
+        const int len = (int)group[b].ids.size();
+        for (int t = 0; t < len; t++) {
+            tok_data[(size_t)b * T_max + t] = group[b].ids[t];
+            pos_data[(size_t)b * T_max + t] = t + ctx->pos_offset;
+        }
+    }
+    ggml_tensor * tok_ids = graph_tensor_or_log(gf, "tok_ids");
+    if (!tok_ids) return {};
+    ggml_backend_tensor_set(tok_ids, tok_data.data(), 0, TB * sizeof(int32_t));
+
+    if (ctx->model.pos_embd) {
+        ggml_tensor * pos_ids = graph_tensor_or_log(gf, "pos_ids");
+        if (!pos_ids) return {};
+        ggml_backend_tensor_set(pos_ids, pos_data.data(), 0, TB * sizeof(int32_t));
+    }
+
+    if (ctx->model.type_embd) {
+        std::vector<int32_t> type_data(TB, 0);
+        for (int b = 0; b < B; b++) {
+            const auto & tids = group[b].type_ids;
+            const int len = std::min((int)group[b].ids.size(), (int)tids.size());
+            for (int t = 0; t < len; t++) type_data[(size_t)b * T_max + t] = tids[t];
+        }
+        ggml_tensor * type_ids = graph_tensor_or_log(gf, "type_ids");
+        if (!type_ids) return {};
+        ggml_backend_tensor_set(type_ids, type_data.data(), 0, TB * sizeof(int32_t));
+    }
+
+    ggml_tensor * pad_mask = graph_tensor_or_log(gf, "pad_mask");
+    if (!pad_mask) return {};
+    std::vector<ggml_fp16_t> mask_data(TB * (size_t)T_max);
+    const ggml_fp16_t zero_f16 = ggml_fp32_to_fp16(0.0f);
+    const ggml_fp16_t ninf_f16 = ggml_fp32_to_fp16(-INFINITY);
+    for (int b = 0; b < B; b++) {
+        const int len = (int)group[b].ids.size();
+        ggml_fp16_t * slab = mask_data.data() + (size_t)b * T_max * T_max;
+        for (int q = 0; q < T_max; q++) {
+            ggml_fp16_t * row = slab + (size_t)q * T_max;
+            for (int k = 0; k < T_max; k++) row[k] = (k < len) ? zero_f16 : ninf_f16;
+        }
+    }
+    ggml_backend_tensor_set(pad_mask, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
+
+    if (!sched_graph_compute(ctx->sched, gf, ctx->n_threads)) {
+        fprintf(stderr, "crispembed: rerank batch compute failed\n");
+        return {};
+    }
+
+    ggml_tensor * out = graph_tensor_or_log(gf, "encoder_out");
+    if (!out) return {};
+    std::vector<float> out_buf((size_t)H * TB);
+    ggml_backend_tensor_get(out, out_buf.data(), 0, (size_t)H * TB * sizeof(float));
+
+    std::vector<std::vector<float>> cls(B);
+    for (int b = 0; b < B; b++) {
+        const float * slab = out_buf.data() + (size_t)b * T_max * H;
+        cls[b].assign(slab, slab + H);
+    }
+    return cls;
+}
+
+static int rerank_scored_batched(crispembed_context * ctx, const char * query,
+                                 const char ** documents, int n_docs, float * out_scores) {
+    std::vector<embed_tokens> toks((size_t)n_docs);
+    std::vector<int> pendentes;
+    pendentes.reserve(n_docs);
+
+    for (int d = 0; d < n_docs; d++) {
+        out_scores[d] = 0.0f;
+        if (!documents[d]) continue;
+        embed_tokens t;
+        if (ctx->use_bpe)
+            t = ctx->bpe_tokenizer.encode_pair(query, documents[d]);
+        else if (ctx->use_sentencepiece)
+            t = ctx->sp_tokenizer.encode_pair(query, documents[d]);
+        else
+            t = ctx->wp_tokenizer.encode_pair(query, documents[d]);
+        int T = 0;
+        for (int i = (int)t.attn_mask.size() - 1; i >= 0; i--) {
+            if (t.attn_mask[i]) { T = i + 1; break; }
+        }
+        if (T == 0) continue;
+        t.ids.resize(T);
+        t.type_ids.resize(T);
+        t.attn_mask.resize(T);
+        toks[d] = std::move(t);
+        pendentes.push_back(d);
+    }
+
+    std::sort(pendentes.begin(), pendentes.end(), [&](int a, int b) {
+        return toks[a].ids.size() < toks[b].ids.size();
+    });
+
+    const int grupo = rerank_batch_group_size();
+    for (size_t i = 0; i < pendentes.size(); i += (size_t)grupo) {
+        const size_t fim = std::min(pendentes.size(), i + (size_t)grupo);
+        std::vector<embed_tokens> lote;
+        lote.reserve(fim - i);
+        for (size_t k = i; k < fim; k++) lote.push_back(toks[pendentes[k]]);
+
+        std::vector<std::vector<float>> cls = run_encoder_cls_group(ctx, lote);
+        if (cls.size() != lote.size()) {
+            for (size_t k = i; k < fim; k++) {
+                const int d = pendentes[k];
+                int raw_T = 0;
+                std::vector<float> raw = run_encoder_raw(ctx, toks[d], 0, &raw_T);
+                out_scores[d] = raw.empty() ? 0.0f : crispembed_apply_classifier(ctx, raw.data(), raw_T);
+            }
+            continue;
+        }
+        for (size_t k = i; k < fim; k++) {
+            const int d = pendentes[k];
+            out_scores[d] = crispembed_apply_classifier(ctx, cls[k - i].data(),
+                                                        (int)toks[d].ids.size());
+        }
+    }
+    return n_docs;
+}
+
 extern "C" int crispembed_rerank_batch(crispembed_context * ctx, const char * query, const char ** documents,
                                        int n_docs, float * out_scores) {
     if (!ctx || !query || !documents || !out_scores || n_docs <= 0) return 0;
@@ -3874,6 +4033,15 @@ extern "C" int crispembed_rerank_batch(crispembed_context * ctx, const char * qu
     // (2-layer heads: jina-reranker-v2) and pooler.weight (DeBERTa
     // ContextPooler: mxbai-rerank), so the duplicate was live on the server's
     // /rerank endpoint. Removed; there is nothing to warm here.
+
+    int min_docs = 16;
+    if (const char * v = core_env::value("CRISPEMBED_RERANK_BATCH_MIN_DOCS")) {
+        const int n = std::atoi(v);
+        if (n > 1) min_docs = n;
+    }
+    if (rerank_batch_enabled(ctx) && n_docs >= min_docs) {
+        return rerank_scored_batched(ctx, query, documents, n_docs, out_scores);
+    }
 
     int scored = 0;
     for (int d = 0; d < n_docs; d++) {

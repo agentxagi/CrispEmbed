@@ -347,7 +347,7 @@ operator candidate has no decoded-quality or release qualification.
 
 <!-- BEGIN GENERATED: tools/list_env_vars.py -->
 
-517 `CRISPEMBED_*` variables and 227 non-prefixed variables. Kind: `on` = `core_env::on` (default off), `off` = `core_env::explicitly_off` (default on, `=0` opts out), `presence` = raw `getenv(X)` truth test (forbidden: `tests/test_env_vars_documented.py` fails on one), `value` = value read via getenv/os.environ, `set` = written by the CLI/orchestrator. Hint = nearest source comment (may be empty).
+520 `CRISPEMBED_*` variables and 227 non-prefixed variables. Kind: `on` = `core_env::on` (default off), `off` = `core_env::explicitly_off` (default on, `=0` opts out), `presence` = raw `getenv(X)` truth test (forbidden: `tests/test_env_vars_documented.py` fails on one), `value` = value read via getenv/os.environ, `set` = written by the CLI/orchestrator. Hint = nearest source comment (may be empty).
 
 ### CLI / server / examples
 
@@ -477,6 +477,9 @@ operator candidate has no decoded-quality or release qualification.
 | `CRISPEMBED_POS_EMBD_TRUNCATE` | off | ON (opt-out `=0`) | bool | production default (opt-out) | `src/crispembed.cpp` | max_position_embeddings - 2 and keeps the special tokens; so do we now. CRISPEMBED_POS_EMBD_TRUNCATE=0 restores the old (aborting) limit. |
 | `CRISPEMBED_RAM_GUARD` | value | unset | value | tuning / config | `src/core/ram_guard.h` |  |
 | `CRISPEMBED_RAM_GUARD_AVAILABLE_MB` | value | unset | int | tuning / config | `src/core/low_memory.h`, `src/core/ram_guard.h` |  |
+| `CRISPEMBED_RERANK_BATCH_GROUP` | value | unset | int | tuning / config | `src/crispembed.cpp` |  |
+| `CRISPEMBED_RERANK_BATCH_MASKED` | on | off | bool | default-off experimental / opt-in | `src/crispembed.cpp` |  |
+| `CRISPEMBED_RERANK_BATCH_MIN_DOCS` | value | unset | int | tuning / config | `src/crispembed.cpp` |  |
 | `CRISPEMBED_RERANK_POOLER_GELU_ERF` | value | unset | string | tuning / config | `src/crispembed.cpp` |  |
 | `CRISPEMBED_SERVER_LEGACY_JSON` | value | unset | value | tuning / config | `src/core/json.h` |  |
 | `CRISPEMBED_SHARED_GPU_BACKEND` | on | off | bool | default-off experimental / opt-in | `src/core/gpu_backend_pref.h` |  |

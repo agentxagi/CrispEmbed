@@ -2102,6 +2102,53 @@ int main(int argc, char ** argv) {
         res.set_content(js.str(), "application/json");
     });
 
+    // POST /colbert/embed — return the per-token ColBERT matrix (VB-4201)
+    svr.Post("/colbert/embed", [&](const httplib::Request & req, httplib::Response & res) {
+        if (!ctx) {
+            res.status = 503;
+            res.set_content("{\"error\": \"no embedding model loaded\"}", "application/json");
+            return;
+        }
+        if (!crispembed_has_colbert(ctx)) {
+            res.status = 400;
+            res.set_content("{\"error\": \"loaded model does not support ColBERT\"}", "application/json");
+            return;
+        }
+        std::string text;
+        {
+            std::vector<std::string> t;
+            if (json_extract_strings(req.body, "text", t) > 0) text = t.front();
+        }
+        if (text.empty()) {
+            res.status = 400;
+            res.set_content("{\"error\": \"missing text field\"}", "application/json");
+            return;
+        }
+        std::lock_guard<std::mutex> lock(model_mutex);
+        int n_tokens = 0, dim = 0;
+        const float * vecs = crispembed_encode_multivec(ctx, text.c_str(), &n_tokens, &dim);
+        if (!vecs || n_tokens == 0) {
+            res.status = 500;
+            res.set_content("{\"error\": \"failed to encode\"}", "application/json");
+            return;
+        }
+        std::string out = "{\"n_tokens\": " + std::to_string(n_tokens) +
+                          ", \"dim\": " + std::to_string(dim) + ", \"vectors\": [";
+        char buf[48];
+        for (int t = 0; t < n_tokens; t++) {
+            if (t) out += ",";
+            out += "[";
+            for (int d = 0; d < dim; d++) {
+                if (d) out += ",";
+                snprintf(buf, sizeof(buf), "%.6g", vecs[(size_t)t * dim + d]);
+                out += buf;
+            }
+            out += "]";
+        }
+        out += "]}";
+        res.set_content(out, "application/json");
+    });
+
     // POST /colbert/score — ColBERT late interaction scoring
     // Request:  {"query": "search text", "documents": ["doc1", "doc2", ...]}
     // Response: {"scores": [{"index": 0, "score": 12.5, "text": "doc1"}, ...], "ms": 5.2}
